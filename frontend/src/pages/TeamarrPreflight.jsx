@@ -26,6 +26,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import {
   Activity,
   AlertCircle,
+  ArrowDownUp,
   CalendarCheck,
   ChevronDown,
   CheckCircle2,
@@ -858,6 +859,17 @@ export default function TeamarrPreflight() {
             {actionLoading === 'scan' || scanning ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <RefreshCw className="mr-2 h-4 w-4" />}
             Scan & Queue Due Checks
           </Button>
+          {config?.probe_only_mode ? (
+            <Button
+              variant="outline"
+              onClick={() => runAction('order-now', teamarrPreflightAPI.triggerOrderNow, 'Teamarr order-now triggered')}
+              disabled={actionLoading !== ''}
+              title="Manually ask Teamarr to re-sort every managed channel now"
+            >
+              {actionLoading === 'order-now' ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <ArrowDownUp className="mr-2 h-4 w-4" />}
+              Order Now (Teamarr)
+            </Button>
+          ) : null}
         </div>
       </div>
 
@@ -1056,6 +1068,21 @@ export default function TeamarrPreflight() {
                   className="mt-1 shrink-0"
                   checked={Boolean(editedConfig.queue_during_active_checks ?? !(editedConfig.defer_during_active_checks ?? editedConfig.skip_during_quality_check))}
                   onCheckedChange={(value) => updateConfigValue('queue_during_active_checks', value)}
+                />
+              </div>
+              <div className="flex min-h-[116px] items-start justify-between gap-5 rounded-md border border-border p-4">
+                <div className="min-w-0 space-y-1">
+                  <Label className="text-base">Probe Only (Teamarr Orders)</Label>
+                  <p className="max-w-[28rem] text-sm leading-snug text-muted-foreground">
+                    Probes each stream and saves its stats to Dispatcharr but skips StreamFlow's own scoring/reorder;
+                    after a successful probe StreamFlow calls Teamarr's "Order streams now" so Teamarr's own rules
+                    order the channel instead.
+                  </p>
+                </div>
+                <Switch
+                  className="mt-1 shrink-0"
+                  checked={editedConfig.probe_only_mode === true}
+                  onCheckedChange={(value) => updateConfigValue('probe_only_mode', value)}
                 />
               </div>
             </div>

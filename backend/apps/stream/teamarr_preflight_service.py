@@ -159,7 +159,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "exclude_sports": [],
     "include_leagues": [],
     "exclude_leagues": [],
+    "probe_only_mode": False,
 }
+TEAMARR_ORDER_NOW_ENDPOINT = "/settings/stream-ordering/apply"
+TEAMARR_ORDER_NOW_MIN_INTERVAL_SECONDS = 5.0
 LEGACY_CONFIG_KEYS = {"defer_during_active_checks", "skip_during_quality_check"}
 CONFIG_KEYS = set(DEFAULT_CONFIG)
 
@@ -241,6 +244,7 @@ def normalize_config(payload: Optional[Dict[str, Any]], current: Optional[Dict[s
     config["managed_event_preflight_enabled"] = bool(config.get("managed_event_preflight_enabled", True))
     config["static_team_preflight_enabled"] = bool(config.get("static_team_preflight_enabled"))
     config["queue_during_active_checks"] = bool(config.get("queue_during_active_checks"))
+    config["probe_only_mode"] = bool(config.get("probe_only_mode"))
     config["teamarr_base_url"] = str(config.get("teamarr_base_url") or "").strip().rstrip("/")
     config["api_key"] = str(config.get("api_key") or "").strip()
     config["api_key_header"] = str(config.get("api_key_header") or DEFAULT_CONFIG["api_key_header"]).strip()[:80]
@@ -326,6 +330,7 @@ class TeamarrPreflightService:
         *,
         config_file: Path = CONFIG_FILE,
         http_get: Callable[..., Any] = requests.get,
+        http_post: Callable[..., Any] = requests.post,
         udi_provider: Callable[[], Any] = get_udi_manager,
         stream_checker_provider: Optional[Callable[[], Any]] = None,
         automation_config_provider: Optional[Callable[[], Any]] = None,
@@ -339,6 +344,7 @@ class TeamarrPreflightService:
     ) -> None:
         self.config_file = config_file
         self.http_get = http_get
+        self.http_post = http_post
         self.udi_provider = udi_provider
         self.stream_checker_provider = stream_checker_provider or self._default_stream_checker_provider
         self.automation_config_provider = automation_config_provider or self._default_automation_config_provider
@@ -412,6 +418,8 @@ class TeamarrPreflightService:
             "last_error": None,
         }
         self._upcoming_truncated = False
+        self._last_teamarr_order_trigger_at: Optional[float] = None
+        self._last_teamarr_order_result: Optional[Dict[str, Any]] = None
 
     def _load_config(self) -> Dict[str, Any]:
         raw_config = load_json_with_backup(
@@ -645,6 +653,10 @@ class TeamarrPreflightService:
                 "managed_events_limit": MAX_UPCOMING_EVENTS,
                 "recent_events": recent_events,
                 "filter_options": dict(self._filter_options),
+                "teamarr_order_now": {
+                    "last_triggered_at": self._last_teamarr_order_trigger_at,
+                    "last_result": self._last_teamarr_order_result,
+                },
                 "teamarr_connector": self._teamarr_connector_status(),
                 "config": public_config(self._config, self._default_profile_metadata()),
             }
@@ -1311,6 +1323,72 @@ class TeamarrPreflightService:
             raise InterruptedError("Teamarr preflight scan was cancelled")
         response.raise_for_status()
         return response.json()
+
+    def trigger_teamarr_order_now(self, config: Dict[str, Any], *, force: bool = False) -> Dict[str, Any]:
+        """Ask Teamarr to re-sort every managed channel by its own ordering rules.
+
+        StreamFlow's probe-only mode intentionally skips its own scoring/reorder
+        so Teamarr's ``Order streams now`` (POST /settings/stream-ordering/apply)
+        can pull the freshly-probed Dispatcharr stream_stats and apply Teamarr's
+        rules instead. That endpoint takes no body and reorders every managed
+        channel, so callers should not invoke this more than needed; a short
+        cooldown collapses bursts from several preflight checks completing close
+        together unless ``force`` is set (used by the manual "Order now" action).
+        """
+        base_url = str(config.get("teamarr_base_url") or "").strip()
+        if not base_url:
+            return {"success": False, "error": "Teamarr base URL is required", "code": "missing_base_url"}
+
+        now = self.clock()
+        with self._lock:
+            last_at = self._last_teamarr_order_trigger_at
+            if not force and last_at is not None and (now - last_at) < TEAMARR_ORDER_NOW_MIN_INTERVAL_SECONDS:
+                return {"success": True, "skipped": True, "reason": "debounced"}
+            self._last_teamarr_order_trigger_at = now
+
+        headers: Dict[str, str] = {}
+        api_key = str(config.get("api_key") or "")
+        if api_key:
+            headers[str(config.get("api_key_header") or DEFAULT_CONFIG["api_key_header"])] = api_key
+
+        try:
+            response = self.http_post(
+                f"{base_url.rstrip('/')}{TEAMARR_ORDER_NOW_ENDPOINT}",
+                headers=headers,
+                timeout=30.0,
+            )
+        except Exception as exc:
+            logger.warning("Teamarr order-now request failed: %s", exc)
+            result = {"success": False, "error": "Teamarr order-now request failed", "code": "request_failed"}
+            with self._lock:
+                self._last_teamarr_order_result = result
+            return result
+
+        if response.status_code == 409:
+            result = {
+                "success": False,
+                "error": "Teamarr generation already in progress",
+                "code": "generation_in_progress",
+            }
+            with self._lock:
+                self._last_teamarr_order_result = result
+            return result
+
+        try:
+            response.raise_for_status()
+            payload = response.json()
+        except Exception as exc:
+            logger.warning("Teamarr order-now returned an unexpected response: %s", exc)
+            result = {"success": False, "error": "Teamarr order-now returned an unexpected response", "code": "bad_response"}
+            with self._lock:
+                self._last_teamarr_order_result = result
+            return result
+
+        result = {"success": True, **(payload if isinstance(payload, dict) else {})}
+        with self._lock:
+            self._last_teamarr_order_result = result
+        logger.info("Teamarr order-now applied: %s", payload)
+        return result
 
     def _events_with_catalog_sports(
         self,
@@ -2099,6 +2177,7 @@ class TeamarrPreflightService:
         checker = self.stream_checker_provider()
         attempted_key = self._attempted_key(event)
         preflight_kind = event.get("preflight_kind") or "event"
+        probe_only = bool(config.get("probe_only_mode"))
         metadata = {
             "source": "teamarr_preflight",
             "preflight_kind": preflight_kind,
@@ -2108,6 +2187,7 @@ class TeamarrPreflightService:
             "trigger_bucket": event.get("trigger_bucket"),
             "attempted_key": attempted_key,
             "may_start_full_run": False,
+            "probe_only": probe_only,
             **quality_profile_details,
             "match_evidence": event.get("match_evidence") or self._match_evidence(event),
             "event": {
@@ -2232,7 +2312,8 @@ class TeamarrPreflightService:
             )
             return
 
-        event_type = "preflight_completed" if result.get("success") else "preflight_failed"
+        success = bool(result.get("success"))
+        event_type = "preflight_completed" if success else "preflight_failed"
         self._record_event(
             event_type,
             event,
@@ -2244,18 +2325,35 @@ class TeamarrPreflightService:
                 **quality_profile_details,
             },
         )
+        if success and metadata.get("probe_only"):
+            self._trigger_teamarr_order_now_after_probe(event)
+
+    def _trigger_teamarr_order_now_after_probe(self, event: Dict[str, Any]) -> None:
+        try:
+            config = self.get_config(include_secret=True)
+            order_result = self.trigger_teamarr_order_now(config)
+            if not order_result.get("success") and not order_result.get("skipped"):
+                self._record_event(
+                    "teamarr_order_now_failed",
+                    event,
+                    {"error": order_result.get("error"), "code": order_result.get("code")},
+                )
+        except Exception as exc:
+            logger.warning("Could not trigger Teamarr order-now after probe: %s", exc)
 
     def _run_check(self, key: str, event: Dict[str, Any], config: Dict[str, Any]) -> None:
         try:
             checker = self.stream_checker_provider()
             forced_profile_id = self._resolve_profile_id(config.get("forced_profile_id"))
             quality_profile_details = self._quality_profile_details(forced_profile_id)
+            probe_only = bool(config.get("probe_only_mode"))
             result = checker.check_single_channel(
                 int(event["dispatcharr_channel_id"]),
                 program_name=event.get("event_name"),
                 is_epg_scheduled=True,
                 forced_profile_id=forced_profile_id,
                 force_check=True,
+                probe_only=probe_only,
             )
             deferral_reason = self._controlled_deferral_reason(result)
             if deferral_reason:
@@ -2273,7 +2371,8 @@ class TeamarrPreflightService:
                 )
                 return
 
-            event_type = "preflight_completed" if result.get("success") else "preflight_failed"
+            success = bool(result.get("success"))
+            event_type = "preflight_completed" if success else "preflight_failed"
             self._finish_active_check(key)
             self._record_event(
                 event_type,
@@ -2286,6 +2385,8 @@ class TeamarrPreflightService:
                     **quality_profile_details,
                 },
             )
+            if success and probe_only:
+                self._trigger_teamarr_order_now_after_probe(event)
         except Exception as exc:
             logger.error(f"Teamarr preflight check failed for channel {event.get('dispatcharr_channel_id')}: {exc}", exc_info=True)
             self._finish_active_check(key)

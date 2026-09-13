@@ -170,6 +170,7 @@ from apps.api.teamarr_preflight_handlers import (
     run_teamarr_preflight_once_response,
     start_teamarr_preflight_response,
     stop_teamarr_preflight_response,
+    trigger_teamarr_order_now_response,
     update_teamarr_preflight_config_response,
 )
 from apps.api.job_arbiter_handlers import get_job_arbiter_status_response
@@ -1736,6 +1737,13 @@ def force_teamarr_preflight_event():
     """Force a manual preflight check for one managed event."""
     return force_teamarr_preflight_event_response(
         payload=request.get_json(silent=True),
+        get_service=get_teamarr_preflight_service,
+    )
+
+@app.route('/api/teamarr-preflight/order-now', methods=['POST'])
+def trigger_teamarr_preflight_order_now():
+    """Manually ask Teamarr to re-sort every managed channel now."""
+    return trigger_teamarr_order_now_response(
         get_service=get_teamarr_preflight_service,
     )
 

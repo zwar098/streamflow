@@ -115,7 +115,61 @@ class TestSingleChannelDeadStreamRemoval(unittest.TestCase):
             force_check_override=False,
             force_check_generation=None,
         )
-    
+
+    @patch('stream_checker_service.StreamCheckConfig')
+    @patch('stream_checker_service.get_udi_manager')
+    @patch('stream_checker_service.fetch_channel_streams')
+    @patch('automated_stream_manager.AutomatedStreamManager')
+    @patch('api_utils.refresh_m3u_playlists')
+    def test_single_channel_probe_only_forwards_to_check_channel(
+        self, mock_refresh, mock_automation_class, mock_fetch_streams, mock_udi, mock_config_class
+    ):
+        """probe_only=True on check_single_channel must reach _check_channel so
+        the reorder/write-back step can be skipped for an external orderer."""
+        from apps.stream.stream_checker_service import StreamCheckerService
+
+        mock_config = Mock()
+        mock_config.get = Mock(side_effect=lambda key, default=None: default)
+        mock_config_class.return_value = mock_config
+
+        mock_udi_instance = Mock()
+        mock_udi.return_value = mock_udi_instance
+        mock_udi_instance.get_channel_by_id.return_value = {
+            'id': 16,
+            'name': 'Test Channel',
+            'logo_id': None,
+        }
+
+        mock_streams = [
+            {'id': 1, 'name': 'Stream 1', 'url': 'http://example.com/stream1', 'm3u_account': 1,
+             'stream_stats': {'status': 'ok'}},
+        ]
+        mock_fetch_streams.side_effect = [mock_streams, mock_streams]
+        mock_udi_instance.refresh_streams = Mock()
+        mock_udi_instance.refresh_channels = Mock()
+        mock_udi_instance.get_streams = Mock(return_value=mock_streams)
+
+        mock_automation_instance = Mock()
+        mock_automation_class.return_value = mock_automation_instance
+        mock_automation_instance.discover_and_assign_streams = Mock(return_value={})
+
+        service = StreamCheckerService()
+        service._check_channel = Mock(return_value={'dead_streams_count': 0, 'revived_streams_count': 0})
+
+        result = service.check_single_channel(channel_id=16, probe_only=True)
+
+        self.assertTrue(result['success'])
+        service._check_channel.assert_called_once_with(
+            16,
+            skip_batch_changelog=True,
+            run_mode='single_channel_check',
+            is_single_channel_check=True,
+            expected_progress_generation=0,
+            force_check_override=False,
+            force_check_generation=None,
+            probe_only=True,
+        )
+
     @patch('stream_checker_service.StreamCheckConfig')
     @patch('stream_checker_service.get_udi_manager')
     @patch('stream_checker_service.fetch_channel_streams')

@@ -84,6 +84,24 @@ def run_teamarr_preflight_once_response(*, get_service: Callable[[], Any]):
         return error_response("Internal Server Error", status_code=500, code="internal_error")
 
 
+def trigger_teamarr_order_now_response(*, get_service: Callable[[], Any]):
+    try:
+        service = get_service()
+        config = service.get_config(include_secret=True)
+        result = service.trigger_teamarr_order_now(config, force=True)
+        if not result.get("success"):
+            status_code = 409 if result.get("code") == "generation_in_progress" else 400
+            return error_response(
+                str(result.get("error") or "Teamarr order-now failed"),
+                status_code=status_code,
+                code=str(result.get("code") or "teamarr_order_now_failed"),
+            )
+        return jsonify(result), 200
+    except Exception as exc:
+        logger.error(f"Error triggering Teamarr order-now: {exc}", exc_info=True)
+        return error_response("Internal Server Error", status_code=500, code="internal_error")
+
+
 def force_teamarr_preflight_event_response(
     *,
     payload: Optional[Dict[str, Any]],

@@ -161,6 +161,7 @@ all active viewer channels, and exclusions always take precedence.
 | POST | `/api/teamarr-preflight/stop` | Stop and cancel pending work |
 | POST | `/api/teamarr-preflight/run-once` | Scan candidates and queue currently due checks |
 | POST | `/api/teamarr-preflight/events/force-check` | Force one selected event or team check |
+| POST | `/api/teamarr-preflight/order-now` | Manually trigger Teamarr's "Order streams now" (used with Probe Only mode) |
 
 ---
 

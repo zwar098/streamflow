@@ -1016,8 +1016,26 @@ class TestStreamCheckQueueLifecycle(unittest.TestCase):
             batch_changelog_generation=23,
             queue_entry_token=29,
             expected_progress_generation=None,
+            probe_only=False,
         )
         service._check_channel_sequential.assert_not_called()
+
+    def test_check_channel_forwards_probe_only_to_check_channel_concurrent(self):
+        service = StreamCheckerService.__new__(StreamCheckerService)
+        service.config = Mock()
+        service.config.get.side_effect = (
+            lambda key, default=None: True
+            if key == 'concurrent_streams.enabled'
+            else default
+        )
+        service._require_quality_check_connectivity = Mock(return_value=None)
+        service._check_channel_concurrent = Mock(return_value={'success': True})
+
+        result = service._check_channel(404, probe_only=True)
+
+        self.assertTrue(result['success'])
+        _, kwargs = service._check_channel_concurrent.call_args
+        self.assertTrue(kwargs['probe_only'])
 
     def test_status_reports_effective_single_worker_in_sequential_mode(self):
         from apps.api.stream_checker_handlers import get_stream_checker_status_response

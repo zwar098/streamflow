@@ -967,6 +967,8 @@ class StreamCheckerService:
             single_check_kwargs['run_mode'] = 'teamarr_preflight'
         if queue_metadata.get('provider_limit_override'):
             single_check_kwargs['provider_limit_override'] = True
+        if queue_metadata.get('probe_only'):
+            single_check_kwargs['probe_only'] = True
 
         with self.lock:
             abort_was_set = self.abort_current_check.is_set()
@@ -3209,11 +3211,12 @@ class StreamCheckerService:
         batch_changelog_generation: Optional[int] = None,
         queue_entry_token: Optional[int] = None,
         expected_progress_generation: Optional[int] = None,
+        probe_only: bool = False,
     ):
         """Check and reorder streams for a specific channel.
-        
+
         Routes to either concurrent or sequential checking based on configuration.
-        
+
         Args:
             channel_id: ID of the channel to check
             skip_batch_changelog: If True, don't add this check to the batch changelog
@@ -3230,6 +3233,9 @@ class StreamCheckerService:
                 stale completion after clear/requeue of the same channel.
             expected_progress_generation: Progress ownership captured by an
                 outer single-channel operation before any long-running work.
+            probe_only: If True, probe streams and persist stream_stats but
+                skip StreamFlow's own reorder/write-back, leaving ordering to
+                an external orderer (e.g. Teamarr).
         """
         progress_owner_active, progress_generation = (
             self._capture_operation_progress_generation(
@@ -3281,6 +3287,7 @@ class StreamCheckerService:
                 batch_changelog_generation=batch_changelog_generation,
                 queue_entry_token=queue_entry_token,
                 expected_progress_generation=progress_generation,
+                probe_only=probe_only,
             )
         else:
             # Keep the user-visible sequential mode while retaining the same
@@ -3300,6 +3307,7 @@ class StreamCheckerService:
                 batch_changelog_generation=batch_changelog_generation,
                 queue_entry_token=queue_entry_token,
                 expected_progress_generation=progress_generation,
+                probe_only=probe_only,
             )
 
     def _complete_channel_check(
@@ -3700,9 +3708,10 @@ class StreamCheckerService:
         batch_changelog_generation: Optional[int] = None,
         queue_entry_token: Optional[int] = None,
         expected_progress_generation: Optional[int] = None,
+        probe_only: bool = False,
     ):
         """Check and reorder streams for a specific channel using parallel thread pool.
-        
+
         Args:
             channel_id: ID of the channel to check
             skip_batch_changelog: If True, don't add this check to the batch changelog
@@ -3725,6 +3734,10 @@ class StreamCheckerService:
                                   stale terminal writes after clear/requeue.
             expected_progress_generation: Progress ownership captured by an
                                   outer entry before connectivity preflight.
+            probe_only: If True, probe and persist stream_stats as usual but
+                                  skip StreamFlow's own reorder/write-back to
+                                  Dispatcharr, leaving stream order for an
+                                  external orderer (e.g. Teamarr) to apply.
         """
         import time as time_module
         from apps.stream.concurrent_stream_limiter import get_smart_scheduler, get_account_limiter, initialize_account_limits
@@ -5324,108 +5337,117 @@ class StreamCheckerService:
             if abort_result:
                 return abort_result
             
-            # Update channel with reordered streams
-            update_run_progress(
-                channel_id=channel_id,
-                channel_name=channel_name,
-                current=len(streams),
-                total=len(streams),
-                status='updating',
-                step='Reordering streams',
-                step_detail='Applying new stream order to channel',
-                **profile_progress_context,
-            )
-            reordered_ids = [s.get('stream_id') for s in analyzed_streams if s.get('stream_id') is not None]
-            reordered_ids = self._merge_protected_stream_order(
-                current_stream_ids,
-                reordered_ids,
-                protected_active_stream_ids,
-            )
-            # Dead streams have already been filtered from analyzed_streams if removal is enabled
-            # If removal is disabled, allow them to remain in the channel
-            
-            # Preserve any stream IDs that are assigned to the channel in Dispatcharr but
-            # were not returned by get_channel_streams() due to a stale UDI stream cache.
-            # Without this guard, a stale cache causes those streams to be silently dropped
-            # when the checker PATCHes the channel's stream list back to Dispatcharr.
-            _uncached_ids = self._get_uncached_channel_stream_ids(
-                assigned_stream_ids,
-                set(reordered_ids),
-                dead_stream_removal_enabled,
-                dead_stream_ids,
-            )
-            if _uncached_ids:
-                logger.warning(
-                    f"Channel {channel_name}: {len(_uncached_ids)} stream ID(s) were assigned "
-                    f"to the channel but absent from the UDI stream cache (stale cache?). "
-                    f"Preserving in write-back to avoid accidental removal: "
-                    f"{_uncached_ids[:5]}{'...' if len(_uncached_ids) > 5 else ''}"
+            # Update channel with reordered streams — unless probe_only is set, in
+            # which case StreamFlow's own scoring/reordering is intentionally
+            # skipped so an external orderer (e.g. Teamarr) can apply its own
+            # order using the stream_stats this check just persisted.
+            if probe_only:
+                logger.info(
+                    f"✓ Channel {channel_name} streams probed only (probe_only=True); "
+                    f"skipping StreamFlow reorder so an external orderer can apply its own order"
                 )
-                reordered_ids.extend(_uncached_ids)
-
-            write_back_valid_stream_ids = self._build_write_back_valid_stream_ids(
-                udi,
-                assigned_stream_ids,
-                dead_stream_removal_enabled,
-            )
-
-            if not hasattr(update_channel_streams, "mock_calls"):
-                failed_connectivity = self._require_quality_check_connectivity(
-                    phase='channel_stream_update',
+            else:
+                update_run_progress(
                     channel_id=channel_id,
                     channel_name=channel_name,
-                    progress_context=profile_progress_context,
+                    current=len(streams),
+                    total=len(streams),
+                    status='updating',
+                    step='Reordering streams',
+                    step_detail='Applying new stream order to channel',
+                    **profile_progress_context,
                 )
-                if failed_connectivity is not None:
-                    return self._fail_channel_for_connectivity(
-                        failed_connectivity,
+                reordered_ids = [s.get('stream_id') for s in analyzed_streams if s.get('stream_id') is not None]
+                reordered_ids = self._merge_protected_stream_order(
+                    current_stream_ids,
+                    reordered_ids,
+                    protected_active_stream_ids,
+                )
+                # Dead streams have already been filtered from analyzed_streams if removal is enabled
+                # If removal is disabled, allow them to remain in the channel
+
+                # Preserve any stream IDs that are assigned to the channel in Dispatcharr but
+                # were not returned by get_channel_streams() due to a stale UDI stream cache.
+                # Without this guard, a stale cache causes those streams to be silently dropped
+                # when the checker PATCHes the channel's stream list back to Dispatcharr.
+                _uncached_ids = self._get_uncached_channel_stream_ids(
+                    assigned_stream_ids,
+                    set(reordered_ids),
+                    dead_stream_removal_enabled,
+                    dead_stream_ids,
+                )
+                if _uncached_ids:
+                    logger.warning(
+                        f"Channel {channel_name}: {len(_uncached_ids)} stream ID(s) were assigned "
+                        f"to the channel but absent from the UDI stream cache (stale cache?). "
+                        f"Preserving in write-back to avoid accidental removal: "
+                        f"{_uncached_ids[:5]}{'...' if len(_uncached_ids) > 5 else ''}"
+                    )
+                    reordered_ids.extend(_uncached_ids)
+
+                write_back_valid_stream_ids = self._build_write_back_valid_stream_ids(
+                    udi,
+                    assigned_stream_ids,
+                    dead_stream_removal_enabled,
+                )
+
+                if not hasattr(update_channel_streams, "mock_calls"):
+                    failed_connectivity = self._require_quality_check_connectivity(
+                        phase='channel_stream_update',
                         channel_id=channel_id,
                         channel_name=channel_name,
+                        progress_context=profile_progress_context,
+                    )
+                    if failed_connectivity is not None:
+                        return self._fail_channel_for_connectivity(
+                            failed_connectivity,
+                            channel_id=channel_id,
+                            channel_name=channel_name,
+                            queue_entry_token=queue_entry_token,
+                        )
+
+                update_authorized, _ = self._run_channel_side_effect_if_authorized(
+                    channel_id,
+                    queue_entry_token,
+                    lambda: update_channel_streams(
+                        channel_id,
+                        reordered_ids,
+                        valid_stream_ids=write_back_valid_stream_ids,
+                        allow_dead_streams=(not dead_stream_removal_enabled),
+                        protected_stream_ids=protected_active_stream_ids,
+                    ),
+                )
+                if not update_authorized:
+                    return self._abort_channel_check(
+                        channel_id,
+                        channel_name,
                         queue_entry_token=queue_entry_token,
                     )
 
-            update_authorized, _ = self._run_channel_side_effect_if_authorized(
-                channel_id,
-                queue_entry_token,
-                lambda: update_channel_streams(
-                    channel_id,
-                    reordered_ids,
-                    valid_stream_ids=write_back_valid_stream_ids,
-                    allow_dead_streams=(not dead_stream_removal_enabled),
-                    protected_stream_ids=protected_active_stream_ids,
-                ),
-            )
-            if not update_authorized:
-                return self._abort_channel_check(
-                    channel_id,
-                    channel_name,
-                    queue_entry_token=queue_entry_token,
+                # Verify the update
+                update_run_progress(
+                    channel_id=channel_id,
+                    channel_name=channel_name,
+                    current=len(streams),
+                    total=len(streams),
+                    status='verifying',
+                    step='Verifying update',
+                    step_detail='Confirming stream order was applied',
+                    **profile_progress_context,
                 )
-            
-            # Verify the update
-            update_run_progress(
-                channel_id=channel_id,
-                channel_name=channel_name,
-                current=len(streams),
-                total=len(streams),
-                status='verifying',
-                step='Verifying update',
-                step_detail='Confirming stream order was applied',
-                **profile_progress_context,
-            )
-            
-            # Only verify if enabled in configuration
-            batch_config = self.config.get('batch_operations', {})
-            verify_updates = batch_config.get('verify_updates', False)
-            
-            if verify_updates:
-                time_module.sleep(0.5)
-                udi.refresh_channel_by_id(channel_id)
-                logger.debug(f"Verified channel {channel_name} update via UDI refresh")
-            else:
-                logger.debug(f"Skipped verification for channel {channel_name} (disabled in config)")
-            
-            logger.info(f"✓ Channel {channel_name} checked and streams reordered (parallel mode)")
+
+                # Only verify if enabled in configuration
+                batch_config = self.config.get('batch_operations', {})
+                verify_updates = batch_config.get('verify_updates', False)
+
+                if verify_updates:
+                    time_module.sleep(0.5)
+                    udi.refresh_channel_by_id(channel_id)
+                    logger.debug(f"Verified channel {channel_name} update via UDI refresh")
+                else:
+                    logger.debug(f"Skipped verification for channel {channel_name} (disabled in config)")
+
+                logger.info(f"✓ Channel {channel_name} checked and streams reordered (parallel mode)")
             
             # Generate detailed stream stats for return value and changelog
             try:
@@ -9018,12 +9040,13 @@ class StreamCheckerService:
         force_check: bool = False,
         provider_limit_override: bool = False,
         run_mode: Optional[str] = None,
+        probe_only: bool = False,
         _operation_already_reserved: bool = False,
         _queue_force_check_generation: Optional[int] = None,
         _queue_entry_token: Optional[int] = None,
     ) -> Dict:
         """Check a single channel immediately and return results.
-        
+
         This performs a targeted channel refresh for a single channel:
         - Identifies M3U accounts used by the channel
         - Refreshes playlists for accounts associated with the channel
@@ -9033,14 +9056,14 @@ class StreamCheckerService:
         - Detects newly dead streams and marks them (if checking is enabled)
         - Detects revived streams and marks them as alive (if checking is enabled)
         - Removes dead streams from the channel (if checking is enabled)
-        
+
         Note: This now works like Global Action but only for the specified channel.
         Dead streams for other channels are not affected.
-        
+
         Channel settings (matching_mode and checking_mode) are respected:
         - If matching_mode is disabled, stream matching is skipped
         - If checking_mode is disabled, stream quality checking is skipped
-        
+
         Args:
             channel_id: ID of the channel to check
             program_name: Optional program name if this is a scheduled EPG check
@@ -9049,7 +9072,11 @@ class StreamCheckerService:
             provider_limit_override: If True, bypass provider/profile capacity
                 skips while still protecting active viewers.
             run_mode: Optional progress context label for specialized callers.
-            
+            probe_only: If True, probe streams and persist their stream_stats
+                to Dispatcharr as usual, but skip StreamFlow's own scoring-based
+                reorder/write-back — for callers that hand ordering off to an
+                external system (e.g. Teamarr's "Order streams now").
+
         Returns:
             Dict with check results and statistics
         """
@@ -9784,6 +9811,8 @@ class StreamCheckerService:
                 )
                 if _queue_entry_token is not None:
                     _check_kwargs['queue_entry_token'] = _queue_entry_token
+                if probe_only:
+                    _check_kwargs['probe_only'] = True
                 check_result = self._check_channel(channel_id, **_check_kwargs)
                 if not check_result or not isinstance(check_result, dict):
                     # This should not happen with updated methods, but provide safe fallback

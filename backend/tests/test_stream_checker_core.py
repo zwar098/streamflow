@@ -268,6 +268,77 @@ class TestProgressTracking(unittest.TestCase):
                                 self.fail(f"NameError for total_streams should not occur: {e}")
                             raise
 
+    @patch('stream_checker_service.fetch_channel_streams')
+    @patch('stream_checker_service.get_udi_manager')
+    @patch('stream_checker_service._get_base_url')
+    def test_probe_only_persists_stream_stats_but_skips_reorder(
+        self, mock_base_url, mock_get_udi, mock_fetch_streams
+    ):
+        """probe_only=True must still write probed stream_stats to Dispatcharr
+        (batch_operations is enabled by default) while skipping the write-back
+        of stream order, so an external orderer (e.g. Teamarr) has fresh stats
+        to read when it applies its own order."""
+        mock_base_url.return_value = "http://test:8000"
+
+        mock_udi = MagicMock()
+        mock_udi.get_channel_by_id.return_value = {
+            'id': 1,
+            'name': 'Test Channel',
+        }
+        mock_udi.get_m3u_accounts.return_value = []
+        mock_get_udi.return_value = mock_udi
+
+        mock_fetch_streams.return_value = [
+            {'id': 1, 'name': 'Stream 1', 'url': 'http://test1'},
+            {'id': 2, 'name': 'Stream 2', 'url': 'http://test2'},
+        ]
+
+        with patch('stream_checker_service.CONFIG_DIR', Path(self.temp_dir)):
+            service = StreamCheckerService()
+            service._require_quality_check_connectivity = Mock(return_value=None)
+
+            def fake_analyze_stream(stream, *args, **kwargs):
+                return {
+                    'stream_id': stream.get('id'),
+                    'stream_name': stream.get('name'),
+                    'stream_url': stream.get('url'),
+                    'resolution': '1920x1080',
+                    'fps': 30,
+                    'video_codec': 'h264',
+                    'audio_codec': 'aac',
+                    'bitrate_kbps': 5000,
+                    'status': 'OK',
+                }
+
+            class FakeSmartScheduler:
+                """Bypasses real capacity/threading and just runs check_function
+                synchronously, so this test exercises the probe_only branch in
+                _check_channel_concurrent without depending on the concurrent
+                scheduler's own timing/capacity machinery."""
+
+                def check_streams_with_limits(self, streams, check_function, **kwargs):
+                    return [check_function(stream) for stream in streams]
+
+            fake_scheduler = FakeSmartScheduler()
+
+            with patch('stream_checker_service.analyze_stream', side_effect=fake_analyze_stream), \
+                 patch(
+                     'apps.stream.concurrent_stream_limiter.get_smart_scheduler',
+                     return_value=fake_scheduler,
+                 ):
+                with patch('stream_checker_service.batch_update_stream_stats', return_value=(2, 0)) as mock_batch_update, \
+                     patch('stream_checker_service.update_channel_streams') as mock_update_order:
+                    result = service._check_channel(1, probe_only=True)
+
+        # _check_channel returns dead/revived counters with no 'error' key on a
+        # normal completion (it does not add a 'success' key itself — that is
+        # layered on by check_single_channel's wrapper).
+        self.assertNotIn('error', result)
+        # Stats must still be written to Dispatcharr...
+        mock_batch_update.assert_called()
+        # ...but StreamFlow must not push its own order back to Dispatcharr.
+        mock_update_order.assert_not_called()
+
 
 class TestLegacySequentialDelegation(unittest.TestCase):
     def test_legacy_sequential_entry_uses_exact_profile_scheduler(self):

@@ -261,6 +261,7 @@ export const teamarrPreflightAPI = {
   stop: () => api.post('/teamarr-preflight/stop'),
   runOnce: () => api.post('/teamarr-preflight/run-once'),
   forceEventCheck: (identity) => api.post('/teamarr-preflight/events/force-check', { identity }),
+  triggerOrderNow: () => api.post('/teamarr-preflight/order-now'),
 };
 
 export const changelogAPI = {
