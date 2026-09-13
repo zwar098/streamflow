@@ -1042,7 +1042,7 @@ class TeamarrPreflightServiceTest(unittest.TestCase):
             time.sleep(0.01)
         self.assertTrue(http_post.called)
         call = http_post.call_args_list[0]
-        self.assertEqual(call[0][0], "http://teamarr.test/settings/stream-ordering/apply")
+        self.assertEqual(call[0][0], "http://teamarr.test/api/v1/settings/stream-ordering/apply")
         self.assertEqual(call.kwargs["headers"]["X-Teamarr-Key"], "secret")
 
     def test_probe_only_mode_off_does_not_request_probe_only_or_trigger_order_now(self):
@@ -1083,7 +1083,7 @@ class TeamarrPreflightServiceTest(unittest.TestCase):
 
         http_post.assert_called_once()
         call = http_post.call_args_list[0]
-        self.assertEqual(call[0][0], "http://teamarr.test/settings/stream-ordering/apply")
+        self.assertEqual(call[0][0], "http://teamarr.test/api/v1/settings/stream-ordering/apply")
 
     def test_queued_check_completion_without_probe_only_does_not_trigger_order_now(self):
         http_post = Mock(return_value=FakeResponse({"channels_reordered": 1}))

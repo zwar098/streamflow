@@ -161,7 +161,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "exclude_leagues": [],
     "probe_only_mode": False,
 }
-TEAMARR_ORDER_NOW_ENDPOINT = "/settings/stream-ordering/apply"
+TEAMARR_ORDER_NOW_ENDPOINT = "/api/v1/settings/stream-ordering/apply"
 TEAMARR_ORDER_NOW_MIN_INTERVAL_SECONDS = 5.0
 LEGACY_CONFIG_KEYS = {"defer_during_active_checks", "skip_during_quality_check"}
 CONFIG_KEYS = set(DEFAULT_CONFIG)
