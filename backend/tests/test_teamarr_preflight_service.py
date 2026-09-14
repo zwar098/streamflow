@@ -335,6 +335,8 @@ class TeamarrPreflightServiceTest(unittest.TestCase):
         http_get = http_get or Mock(return_value=FakeResponse(events))
         http_post = http_post or Mock(return_value=FakeResponse({"channels_reordered": 0, "streams_reordered": 0}))
         db = db or FakeDb()
+        service_kwargs = {"sleep_fn": lambda seconds: None}
+        service_kwargs.update(service_options or {})
         service = TeamarrPreflightService(
             config_file=self.config_file,
             http_get=http_get,
@@ -345,7 +347,7 @@ class TeamarrPreflightServiceTest(unittest.TestCase):
             automation_status_provider=lambda: automation_status,
             db_provider=lambda: db,
             clock=lambda: FIXED_NOW,
-            **(service_options or {}),
+            **service_kwargs,
         )
         service.update_config({
             "teamarr_base_url": "http://teamarr.test",
@@ -386,6 +388,10 @@ class TeamarrPreflightServiceTest(unittest.TestCase):
         self.assertFalse(normalize_config({"defer_during_active_checks": True})["queue_during_active_checks"])
         self.assertTrue(normalize_config({"defer_during_active_checks": False})["queue_during_active_checks"])
         self.assertTrue(normalize_config({"queue_during_active_checks": True})["queue_during_active_checks"])
+        self.assertEqual(normalize_config({})["teamarr_order_now_delay_seconds"], 3)
+        self.assertEqual(normalize_config({"teamarr_order_now_delay_seconds": 99})["teamarr_order_now_delay_seconds"], 30)
+        self.assertEqual(normalize_config({"teamarr_order_now_delay_seconds": -5})["teamarr_order_now_delay_seconds"], 0)
+        self.assertEqual(normalize_config({"teamarr_order_now_delay_seconds": 0})["teamarr_order_now_delay_seconds"], 0)
 
         service, _, _ = self.make_service([])
         public_config = service.get_config()
@@ -1045,6 +1051,52 @@ class TeamarrPreflightServiceTest(unittest.TestCase):
         self.assertEqual(call[0][0], "http://teamarr.test/api/v1/settings/stream-ordering/apply")
         self.assertEqual(call.kwargs["headers"]["X-Teamarr-Key"], "secret")
 
+    def test_probe_only_mode_delays_order_now_by_configured_settle_seconds(self):
+        checker = FakeChecker()
+        http_post = Mock(return_value=FakeResponse({"channels_reordered": 1}))
+        sleep_calls = []
+
+        service, _, _ = self.make_service(
+            [make_event()],
+            checker=checker,
+            http_post=http_post,
+            service_options={"sleep_fn": lambda seconds: sleep_calls.append(seconds)},
+        )
+        service.update_config({"probe_only_mode": True, "teamarr_order_now_delay_seconds": 7})
+
+        result = service.run_once(force=True)
+        self.assertTrue(result["success"])
+
+        deadline = time.time() + 2
+        while time.time() < deadline and not http_post.called:
+            time.sleep(0.01)
+
+        self.assertTrue(http_post.called)
+        self.assertEqual(sleep_calls, [7])
+
+    def test_probe_only_mode_zero_delay_triggers_order_now_synchronously(self):
+        checker = FakeChecker()
+        http_post = Mock(return_value=FakeResponse({"channels_reordered": 1}))
+        sleep_calls = []
+
+        service, _, _ = self.make_service(
+            [make_event()],
+            checker=checker,
+            http_post=http_post,
+            service_options={"sleep_fn": lambda seconds: sleep_calls.append(seconds)},
+        )
+        service.update_config({"probe_only_mode": True, "teamarr_order_now_delay_seconds": 0})
+
+        result = service.run_once(force=True)
+        self.assertTrue(result["success"])
+
+        deadline = time.time() + 2
+        while time.time() < deadline and not http_post.called:
+            time.sleep(0.01)
+
+        self.assertTrue(http_post.called)
+        self.assertEqual(sleep_calls, [])
+
     def test_probe_only_mode_off_does_not_request_probe_only_or_trigger_order_now(self):
         checker = FakeChecker()
         http_post = Mock(return_value=FakeResponse({"channels_reordered": 0}))
@@ -1081,6 +1133,9 @@ class TeamarrPreflightServiceTest(unittest.TestCase):
         }
         service.record_queued_check_result(metadata, {"success": True, "stats": {}})
 
+        deadline = time.time() + 2
+        while time.time() < deadline and not http_post.called:
+            time.sleep(0.01)
         http_post.assert_called_once()
         call = http_post.call_args_list[0]
         self.assertEqual(call[0][0], "http://teamarr.test/api/v1/settings/stream-ordering/apply")

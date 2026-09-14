@@ -48,6 +48,7 @@ const numberFields = [
   { key: 'post_start_grace_minutes', label: 'Post Start Grace', suffix: 'min', min: 0, max: 120, description: 'How long after start post-start offsets can still run.' },
   { key: 'max_concurrent_checks', label: 'Concurrent Checks', suffix: 'max', min: 1, max: 10, description: 'Maximum Teamarr event checks running at the same time.' },
   { key: 'event_cooldown_minutes', label: 'Event Cooldown', suffix: 'min', min: 1, max: 10080, description: 'Prevents the same event bucket from repeating after it already ran.' },
+  { key: 'teamarr_order_now_delay_seconds', label: 'Order-Now Settle Delay', suffix: 'sec', min: 0, max: 30, description: 'Only used with Probe Only mode. Wait this long after a probe finishes before asking Teamarr to order streams, so Dispatcharr has time to persist the new stats before Teamarr re-reads them.' },
 ]
 
 const eventLabels = {

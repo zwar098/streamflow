@@ -160,6 +160,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "include_leagues": [],
     "exclude_leagues": [],
     "probe_only_mode": False,
+    "teamarr_order_now_delay_seconds": 3,
 }
 TEAMARR_ORDER_NOW_ENDPOINT = "/api/v1/settings/stream-ordering/apply"
 TEAMARR_ORDER_NOW_MIN_INTERVAL_SECONDS = 5.0
@@ -172,6 +173,7 @@ INT_BOUNDS = {
     "post_start_grace_minutes": (0, 120),
     "max_concurrent_checks": (1, 10),
     "event_cooldown_minutes": (1, 10080),
+    "teamarr_order_now_delay_seconds": (0, 30),
 }
 
 
@@ -341,10 +343,12 @@ class TeamarrPreflightService:
         static_team_scan_budget_seconds: float = STATIC_TEAM_SCAN_BUDGET_SECONDS,
         stop_wait_seconds: float = PREFLIGHT_STOP_WAIT_SECONDS,
         clock: Callable[[], float] = time.time,
+        sleep_fn: Callable[[float], None] = time.sleep,
     ) -> None:
         self.config_file = config_file
         self.http_get = http_get
         self.http_post = http_post
+        self.sleep_fn = sleep_fn
         self.udi_provider = udi_provider
         self.stream_checker_provider = stream_checker_provider or self._default_stream_checker_provider
         self.automation_config_provider = automation_config_provider or self._default_automation_config_provider
@@ -2331,15 +2335,40 @@ class TeamarrPreflightService:
     def _trigger_teamarr_order_now_after_probe(self, event: Dict[str, Any]) -> None:
         try:
             config = self.get_config(include_secret=True)
-            order_result = self.trigger_teamarr_order_now(config)
-            if not order_result.get("success") and not order_result.get("skipped"):
-                self._record_event(
-                    "teamarr_order_now_failed",
-                    event,
-                    {"error": order_result.get("error"), "code": order_result.get("code")},
-                )
         except Exception as exc:
             logger.warning("Could not trigger Teamarr order-now after probe: %s", exc)
+            return
+
+        delay_seconds = max(0.0, float(config.get("teamarr_order_now_delay_seconds") or 0))
+
+        def _fire() -> None:
+            try:
+                if delay_seconds > 0:
+                    self.sleep_fn(delay_seconds)
+                order_result = self.trigger_teamarr_order_now(config)
+                if not order_result.get("success") and not order_result.get("skipped"):
+                    self._record_event(
+                        "teamarr_order_now_failed",
+                        event,
+                        {"error": order_result.get("error"), "code": order_result.get("code")},
+                    )
+            except Exception as exc:
+                logger.warning("Could not trigger Teamarr order-now after probe: %s", exc)
+
+        if delay_seconds > 0:
+            # A short settle delay lets Dispatcharr finish persisting the
+            # stats this probe just wrote before Teamarr re-reads them —
+            # without it, Teamarr's bulk stats fetch can race the write and
+            # sort by whatever it had cached beforehand. Runs off-thread so
+            # it never blocks the check-completion path (direct thread or
+            # the stream checker's queue worker) that called us.
+            threading.Thread(
+                target=_fire,
+                name="TeamarrOrderNowDelay",
+                daemon=True,
+            ).start()
+        else:
+            _fire()
 
     def _run_check(self, key: str, event: Dict[str, Any], config: Dict[str, Any]) -> None:
         try:
