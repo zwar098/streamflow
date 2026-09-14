@@ -139,6 +139,61 @@ def test_changelog_response_filters_by_v6_job_category():
     assert payload["data"][0]["id"] is not None
 
 
+def test_changelog_response_filters_by_source_before_pagination():
+    # The automation_run is saved first (oldest timestamp), then enough
+    # filler entries to push it past a small page size under
+    # ORDER BY timestamp DESC. Before this fix, the Source filter only ran
+    # client-side on an already-paginated page, so an automation_run this
+    # far back would never appear no matter what page you asked for.
+    save_generic_telemetry("automation_run", {"success": True})
+    for i in range(6):
+        save_generic_telemetry("single_channel_check", {"channel_id": i, "success": True})
+
+    app = Flask(__name__)
+    with app.app_context():
+        response = get_changelog_response(
+            request_args=MultiDict({"days": "7", "source": "full_runs", "limit": "5", "page": "1"})
+        )
+
+    payload = response.get_json()
+    assert payload["total"] == 1
+    assert payload["total_pages"] == 1
+    assert len(payload["data"]) == 1
+    assert payload["data"][0]["action"] == "automation_run"
+
+
+def test_changelog_response_source_filter_matches_text_search_buckets():
+    save_generic_telemetry(
+        "single_channel_check",
+        {"channel_id": 1, "success": True, "dead_stream_detected": True},
+    )
+    save_generic_telemetry("playlist_refresh", {"provider_id": 2, "success": True})
+
+    app = Flask(__name__)
+    with app.app_context():
+        response = get_changelog_response(
+            request_args=MultiDict({"days": "7", "source": "dead_revive"})
+        )
+
+    payload = response.get_json()
+    assert payload["total"] == 1
+    assert payload["data"][0]["action"] == "single_channel_check"
+
+
+def test_changelog_response_unknown_source_returns_all():
+    save_generic_telemetry("single_channel_check", {"channel_id": 1, "success": True})
+    save_generic_telemetry("playlist_refresh", {"provider_id": 2, "success": True})
+
+    app = Flask(__name__)
+    with app.app_context():
+        response = get_changelog_response(
+            request_args=MultiDict({"days": "7", "source": "all"})
+        )
+
+    payload = response.get_json()
+    assert payload["total"] == 2
+
+
 def test_changelog_run_export_is_scoped_to_single_run():
     save_generic_telemetry(
         "single_channel_check",

@@ -144,6 +144,33 @@ _RUN_SNAPSHOT_PRIVATE_KEY_FRAGMENTS = (
 _SNAPSHOT_EXPORT_OMIT = object()
 
 
+_SOURCE_FILTER_SINGLE_CHECKS = {"single_channel_check"}
+_SOURCE_FILTER_FULL_RUNS = {"automation_run", "global_check", "batch_stream_check"}
+
+
+def _entry_matches_source_filter(entry: Dict[str, Any], source_filter: str) -> bool:
+    """Mirror the frontend's Source dropdown grouping (Changelog.jsx's
+    entryMatchesSourceFilter) so server-side pagination and the Source filter
+    agree on which rows match instead of the dropdown filtering a page that
+    was already sliced without it.
+    """
+    if not source_filter or source_filter == "all":
+        return True
+    action = entry.get("action")
+    if source_filter == "single_checks":
+        return action in _SOURCE_FILTER_SINGLE_CHECKS
+    if source_filter == "full_runs":
+        return action in _SOURCE_FILTER_FULL_RUNS
+    text = json.dumps(entry).lower()
+    if source_filter == "dead_revive":
+        return "dead_stream" in text or "revived_stream" in text or "streams_revived" in text
+    if source_filter == "blank_freeze_loop":
+        return "blank" in text or "freeze" in text or "loop" in text
+    if source_filter == "teamarr_preflight":
+        return "teamarr" in text or "preflight" in text
+    return True
+
+
 def get_changelog_response(*, request_args: Any):
     """Handle changelog listing with in-memory pagination over telemetry runs."""
     try:
@@ -153,6 +180,7 @@ def get_changelog_response(*, request_args: Any):
         job_category = (request_args.get("job_category") or request_args.get("category") or "").strip()
         job_outcome = (request_args.get("job_outcome") or request_args.get("outcome") or "").strip()
         action_filter = (request_args.get("action") or "").strip()
+        source_filter = (request_args.get("source") or "").strip()
 
         from apps.telemetry.telemetry_db import Run, get_session
 
@@ -195,6 +223,12 @@ def get_changelog_response(*, request_args: Any):
                         "subentries": subentries,
                     }
                 )
+
+            if source_filter:
+                merged_changelog = [
+                    entry for entry in merged_changelog
+                    if _entry_matches_source_filter(entry, source_filter)
+                ]
 
             total = len(merged_changelog)
             total_pages = (total + limit - 1) // limit if limit > 0 else 0

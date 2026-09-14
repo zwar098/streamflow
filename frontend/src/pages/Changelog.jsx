@@ -1062,12 +1062,15 @@ export default function Changelog() {
 
   useEffect(() => {
     loadChangelog()
-  }, [days, page, actionFilter])
+  }, [days, page, actionFilter, sourceFilter])
 
   const loadChangelog = async () => {
     try {
       setLoading(true)
-      const response = await changelogAPI.getChangelog(days, page, 10)
+      const filters = {}
+      if (actionFilter !== 'all') filters.action = actionFilter
+      if (sourceFilter !== 'all') filters.source = sourceFilter
+      const response = await changelogAPI.getChangelog(days, page, 10, filters)
 
       const responseData = response.data || {};
       const dataArray = Array.isArray(responseData) ? responseData : (responseData.data || []);
