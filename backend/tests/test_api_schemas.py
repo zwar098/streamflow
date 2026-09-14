@@ -139,6 +139,29 @@ def test_auto_create_rule_test_schema_accepts_channel_group_binding():
     assert parsed.channel_ids == []
     assert parsed.channel_group_ids == [10]
     assert parsed.minutes_before == 0
+    assert parsed.timing_direction == "before"
+
+
+def test_auto_create_rule_test_schema_accepts_after_timing_direction():
+    parsed = AutoCreateRuleTestSchema.from_payload({
+        "regex_pattern": "Cup",
+        "channel_group_ids": [10],
+        "minutes_before": 15,
+        "timing_direction": "after",
+    })
+
+    assert parsed.timing_direction == "after"
+
+
+def test_auto_create_rule_test_schema_rejects_invalid_timing_direction():
+    with pytest.raises(ValidationError) as exc:
+        AutoCreateRuleTestSchema.from_payload({
+            "regex_pattern": "Cup",
+            "channel_group_ids": [10],
+            "timing_direction": "sideways",
+        })
+
+    assert "timing_direction" in str(exc.value)
 
 
 def test_automation_profile_schema_normalizes_remove_dead_streams_flag():

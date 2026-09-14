@@ -67,6 +67,7 @@ export default function Scheduling() {
   const [ruleName, setRuleName] = useState('')
   const [ruleRegexPattern, setRuleRegexPattern] = useState('')
   const [ruleMinutesBefore, setRuleMinutesBefore] = useState(5)
+  const [ruleTimingDirection, setRuleTimingDirection] = useState('before')  // 'before' or 'after' program start
   const [ruleMaxEventsPerRun, setRuleMaxEventsPerRun] = useState(DEFAULT_AUTO_CREATE_MAX_EVENTS_PER_RUN)
   const [ruleScheduleType, setRuleScheduleType] = useState('check')  // 'check' or 'monitoring'
   const [ruleEnableLoopingDetection, setRuleEnableLoopingDetection] = useState(true)
@@ -103,6 +104,7 @@ export default function Scheduling() {
     setRuleSelectedChannelGroups([])
     setRuleRegexPattern('')
     setRuleMinutesBefore(5)
+    setRuleTimingDirection('before')
     setRuleMaxEventsPerRun(DEFAULT_AUTO_CREATE_MAX_EVENTS_PER_RUN)
     setRuleScheduleType('check')
     setRuleEnableLoopingDetection(true)
@@ -324,6 +326,7 @@ export default function Scheduling() {
         channel_group_ids: selectedGroupIds,
         regex_pattern: ruleRegexPattern,
         minutes_before: parseInt(ruleMinutesBefore) || 0,
+        timing_direction: ruleTimingDirection,
         max_events_per_run: parseInt(ruleMaxEventsPerRun) || DEFAULT_AUTO_CREATE_MAX_EVENTS_PER_RUN,
       })
 
@@ -402,6 +405,7 @@ export default function Scheduling() {
         channel_group_ids: ruleSelectedChannelGroups.map(g => g.id),
         regex_pattern: ruleRegexPattern,
         minutes_before: minutesBeforeValue,
+        timing_direction: ruleTimingDirection,
         max_events_per_run: parseInt(ruleMaxEventsPerRun),
         schedule_type: ruleScheduleType,
         enable_looping_detection: ruleEnableLoopingDetection,
@@ -463,6 +467,7 @@ export default function Scheduling() {
     setRuleName(rule.name)
     setRuleRegexPattern(rule.regex_pattern)
     setRuleMinutesBefore(rule.minutes_before)
+    setRuleTimingDirection(rule.timing_direction || 'before')
     setRuleMaxEventsPerRun(rule.max_events_per_run || DEFAULT_AUTO_CREATE_MAX_EVENTS_PER_RUN)
     setRuleScheduleType(rule.schedule_type || 'check')  // Default to 'check' for backward compatibility
     setRuleEnableLoopingDetection(rule.enable_looping_detection !== false)
@@ -634,6 +639,7 @@ export default function Scheduling() {
       setRuleName(rule.name || '')
       setRuleRegexPattern(rule.regex_pattern || '')
       setRuleMinutesBefore(rule.minutes_before || 5)
+      setRuleTimingDirection(rule.timing_direction || 'before')
       setRuleMaxEventsPerRun(rule.max_events_per_run || DEFAULT_AUTO_CREATE_MAX_EVENTS_PER_RUN)
 
       // Handle channel selection
@@ -1566,19 +1572,34 @@ export default function Scheduling() {
                           </div>
                         )}
 
-                        {/* Minutes Before Input */}
+                        {/* Minutes Before/After Program Start */}
                         <div className="space-y-2">
-                          <Label htmlFor="rule-minutes-before">Minutes Before Program Start</Label>
-                          <Input
-                            id="rule-minutes-before"
-                            type="number"
-                            min="0"
-                            max="120"
-                            value={ruleMinutesBefore}
-                            onChange={(e) => setRuleMinutesBefore(e.target.value)}
-                          />
+                          <Label htmlFor="rule-minutes-before">Check Timing</Label>
+                          <div className="flex gap-2">
+                            <Input
+                              id="rule-minutes-before"
+                              type="number"
+                              min="0"
+                              max="120"
+                              value={ruleMinutesBefore}
+                              onChange={(e) => setRuleMinutesBefore(e.target.value)}
+                              className="flex-1"
+                            />
+                            <Select
+                              value={ruleTimingDirection}
+                              onValueChange={setRuleTimingDirection}
+                            >
+                              <SelectTrigger id="rule-timing-direction" className="w-[140px]">
+                                <SelectValue />
+                              </SelectTrigger>
+                              <SelectContent>
+                                <SelectItem value="before">Before Start</SelectItem>
+                                <SelectItem value="after">After Start</SelectItem>
+                              </SelectContent>
+                            </Select>
+                          </div>
                           <p className="text-sm text-muted-foreground">
-                            Channel checks will run {ruleMinutesBefore || 0} minutes before matching programs start
+                            Channel checks will run {ruleMinutesBefore || 0} minutes {ruleTimingDirection === 'after' ? 'after' : 'before'} matching programs start
                           </p>
                         </div>
 
@@ -1705,7 +1726,7 @@ export default function Scheduling() {
                     <TableHead>Rule Name</TableHead>
                     <TableHead>Channels</TableHead>
                     <TableHead>Regex Pattern</TableHead>
-                    <TableHead>Minutes Before</TableHead>
+                    <TableHead>Check Timing</TableHead>
                     <TableHead>Max Checks</TableHead>
                     <TableHead className="text-right">Actions</TableHead>
                   </TableRow>
@@ -1793,7 +1814,7 @@ export default function Scheduling() {
                         <TableCell>
                           <code className="text-xs bg-muted px-2 py-1 rounded">{rule.regex_pattern}</code>
                         </TableCell>
-                        <TableCell>{rule.minutes_before} min</TableCell>
+                        <TableCell>{rule.minutes_before} min {rule.timing_direction === 'after' ? 'after' : 'before'}</TableCell>
                         <TableCell>{rule.max_events_per_run || DEFAULT_AUTO_CREATE_MAX_EVENTS_PER_RUN}</TableCell>
                         <TableCell className="text-right">
                           <div className="flex items-center justify-end gap-1">

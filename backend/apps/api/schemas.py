@@ -622,6 +622,7 @@ class AutoCreateRuleTestSchema:
     channel_group_ids: List[Any]
     regex_pattern: str
     minutes_before: int
+    timing_direction: str
     max_events_per_run: Optional[int]
 
     @classmethod
@@ -661,6 +662,10 @@ class AutoCreateRuleTestSchema:
         if minutes_before < 0:
             raise ValidationError("minutes_before must be 0 or greater")
 
+        timing_direction = data.get("timing_direction", "before")
+        if timing_direction not in ("before", "after"):
+            raise ValidationError("timing_direction must be 'before' or 'after'")
+
         max_events_per_run = None
         if "max_events_per_run" in data:
             try:
@@ -676,6 +681,7 @@ class AutoCreateRuleTestSchema:
             channel_group_ids=channel_group_ids,
             regex_pattern=str(data["regex_pattern"]),
             minutes_before=minutes_before,
+            timing_direction=timing_direction,
             max_events_per_run=max_events_per_run,
         )
 

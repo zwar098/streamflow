@@ -102,7 +102,93 @@ class TestSchedulingService(unittest.TestCase):
         self.assertEqual(rule['channels_info'][0]['name'], 'Test Channel')
         self.assertEqual(rule['regex_pattern'], '^Breaking News')
         self.assertEqual(rule['minutes_before'], 5)
-    
+        self.assertEqual(rule['timing_direction'], 'before')
+
+    def test_create_auto_create_rule_with_after_direction(self):
+        """A rule may schedule its check after program start instead of before."""
+        rule_data = {
+            'name': 'After Start Rule',
+            'channel_id': 1,
+            'regex_pattern': '^Breaking News',
+            'minutes_before': 10,
+            'timing_direction': 'after',
+        }
+
+        with patch.object(self.service, 'match_programs_to_rules'):
+            rule = self.service.create_auto_create_rule(rule_data)
+
+        self.assertEqual(rule['timing_direction'], 'after')
+
+    def test_create_auto_create_rule_rejects_unknown_direction(self):
+        """An invalid timing_direction falls back to 'before' rather than erroring,
+        matching how every other malformed/missing optional field on this rule is handled."""
+        rule_data = {
+            'name': 'Bad Direction Rule',
+            'channel_id': 1,
+            'regex_pattern': '^Breaking News',
+            'minutes_before': 5,
+            'timing_direction': 'sideways',
+        }
+
+        with patch.object(self.service, 'match_programs_to_rules'):
+            rule = self.service.create_auto_create_rule(rule_data)
+
+        self.assertEqual(rule['timing_direction'], 'before')
+
+    def test_update_auto_create_rule_timing_direction(self):
+        """An existing rule can be switched from before to after start."""
+        rule_data = {
+            'name': 'Switchable Rule',
+            'channel_id': 1,
+            'regex_pattern': '^Breaking News',
+            'minutes_before': 5,
+        }
+        with patch.object(self.service, 'match_programs_to_rules'):
+            rule = self.service.create_auto_create_rule(rule_data)
+        self.assertEqual(rule['timing_direction'], 'before')
+
+        with patch.object(self.service, 'match_programs_to_rules'):
+            updated = self.service.update_auto_create_rule(
+                rule['id'], {'timing_direction': 'after'}
+            )
+
+        self.assertEqual(updated['timing_direction'], 'after')
+
+    def test_program_schedule_timing_before_and_after_directions(self):
+        """_program_schedule_timing must compute check_time on the correct
+        side of program start depending on timing_direction, since every
+        auto-create consumer (matching loop, preview, dedup) shares this
+        one function."""
+        now = datetime.now(timezone.utc)
+        program = {
+            'start_time': (now + timedelta(minutes=10)).isoformat(),
+            'end_time': (now + timedelta(hours=1)).isoformat(),
+        }
+
+        before = self.service._program_schedule_timing(program, 15, now, 'before')
+        self.assertEqual(before['state'], 'due_now')
+        self.assertAlmostEqual(
+            (before['check_time'] - (now - timedelta(minutes=5))).total_seconds(), 0, delta=1
+        )
+
+        after = self.service._program_schedule_timing(program, 15, now, 'after')
+        self.assertEqual(after['state'], 'future')
+        self.assertAlmostEqual(
+            (after['check_time'] - (now + timedelta(minutes=25))).total_seconds(), 0, delta=1
+        )
+
+    def test_program_schedule_timing_defaults_to_before(self):
+        """Callers that omit timing_direction (e.g. rules saved before this
+        option existed) must keep computing check_time before program start."""
+        now = datetime.now(timezone.utc)
+        program = {
+            'start_time': (now + timedelta(minutes=10)).isoformat(),
+            'end_time': (now + timedelta(hours=1)).isoformat(),
+        }
+
+        timing = self.service._program_schedule_timing(program, 15, now)
+        self.assertEqual(timing['state'], 'due_now')
+
     def test_create_rule_with_invalid_regex(self):
         """Test creating a rule with invalid regex raises ValueError."""
         rule_data = {

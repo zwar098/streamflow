@@ -328,6 +328,68 @@ class TestAutoCreateRulesImportExport(unittest.TestCase):
         finally:
             udi.get_channel_by_id = original_get_channel
 
+    def test_round_trip_preserves_timing_direction(self):
+        """A rule scheduled after program start must still say 'after' once
+        exported and re-imported — export/import previously only carried
+        minutes_before, which would have silently reverted every 'after'
+        rule back to 'before' on the very next backup/restore."""
+        rule_data = {
+            'name': 'After Start Rule',
+            'channel_ids': [1],
+            'regex_pattern': '^Test',
+            'minutes_before': 20,
+            'timing_direction': 'after',
+        }
+
+        udi = get_udi_manager()
+        original_get_channel = udi.get_channel_by_id
+
+        def mock_get_channel(channel_id):
+            if channel_id == 1:
+                return {'id': 1, 'name': 'Test Channel', 'tvg_id': 'test.channel'}
+            return None
+
+        try:
+            udi.get_channel_by_id = mock_get_channel
+
+            self.service.create_auto_create_rule(rule_data)
+            exported = self.service.export_auto_create_rules()
+            self.assertEqual(exported[0]['timing_direction'], 'after')
+
+            self.service._auto_create_rules = []
+            self.service._save_auto_create_rules()
+
+            result = self.service.import_auto_create_rules(exported)
+            self.assertEqual(result['imported'], 1)
+
+            final_rules = self.service.get_auto_create_rules()
+            self.assertEqual(final_rules[0]['timing_direction'], 'after')
+        finally:
+            udi.get_channel_by_id = original_get_channel
+
+    def test_export_defaults_missing_timing_direction_to_before(self):
+        """Rules created before timing_direction existed must still export
+        as 'before' rather than an absent/null field."""
+        rule_data = {
+            'name': 'Legacy Rule',
+            'channel_ids': [1],
+            'regex_pattern': '^Test',
+            'minutes_before': 5,
+        }
+
+        udi = get_udi_manager()
+        original_get_channel = udi.get_channel_by_id
+        udi.get_channel_by_id = lambda channel_id: (
+            {'id': 1, 'name': 'Test Channel', 'tvg_id': 'test.channel'} if channel_id == 1 else None
+        )
+
+        try:
+            self.service.create_auto_create_rule(rule_data)
+            exported = self.service.export_auto_create_rules()
+            self.assertEqual(exported[0]['timing_direction'], 'before')
+        finally:
+            udi.get_channel_by_id = original_get_channel
+
 
 if __name__ == '__main__':
     unittest.main()

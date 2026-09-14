@@ -1007,11 +1007,21 @@ class SchedulingService:
             'finishTime',
         )))
 
+    @staticmethod
+    def _normalize_timing_direction(value: Any) -> str:
+        """Normalize a rule's timing direction, defaulting to 'before'.
+
+        Keeps every rule saved or imported before this option existed
+        behaving exactly as it did — only an explicit 'after' opts in.
+        """
+        return 'after' if value == 'after' else 'before'
+
     def _program_schedule_timing(
         self,
         program: Dict[str, Any],
         minutes_before: int,
         now: datetime,
+        timing_direction: str = 'before',
     ) -> Dict[str, Any]:
         program_start = self._program_start_time(program)
         program_end = self._program_end_time(program)
@@ -1034,10 +1044,12 @@ class SchedulingService:
                 'error': str(exc),
             }
 
+        offset = timedelta(minutes=minutes_before)
+        check_time = start_dt + offset if timing_direction == 'after' else start_dt - offset
+
         if end_dt <= now:
             state = 'ended'
         else:
-            check_time = start_dt - timedelta(minutes=minutes_before)
             state = 'due_now' if check_time <= now else 'future'
 
         return {
@@ -1046,7 +1058,7 @@ class SchedulingService:
             'program_end_time': program_end,
             'start_dt': start_dt,
             'end_dt': end_dt,
-            'check_time': start_dt - timedelta(minutes=minutes_before),
+            'check_time': check_time,
         }
 
     def _program_epg_identifiers(self, program: Dict[str, Any]) -> List[str]:
@@ -1233,6 +1245,7 @@ class SchedulingService:
                 'channels_info': channels_info,
                 'regex_pattern': rule_data['regex_pattern'],
                 'minutes_before': rule_data.get('minutes_before', 5),
+                'timing_direction': self._normalize_timing_direction(rule_data.get('timing_direction')),
                 'max_events_per_run': self._normalize_rule_max_events_per_run(
                     rule_data.get('max_events_per_run')
                 ),
@@ -1316,6 +1329,9 @@ class SchedulingService:
                           'enable_looping_detection', 'enable_logo_detection']:
                 if field in rule_data:
                     rule[field] = rule_data[field]
+
+            if 'timing_direction' in rule_data:
+                rule['timing_direction'] = self._normalize_timing_direction(rule_data.get('timing_direction'))
 
             if 'max_events_per_run' in rule_data:
                 rule['max_events_per_run'] = self._normalize_rule_max_events_per_run(
@@ -1417,10 +1433,12 @@ class SchedulingService:
         channel_group_ids: Optional[List[Any]] = None,
         regex_pattern: str,
         minutes_before: int = 0,
+        timing_direction: str = 'before',
         max_events_per_run: Optional[int] = None,
         force_refresh: bool = False,
     ) -> Dict[str, Any]:
         """Test an auto-create regex against every selected channel and group channel."""
+        timing_direction = self._normalize_timing_direction(timing_direction)
         if not regex_pattern or not regex_pattern.strip():
             raise ValueError("Regex pattern must not be empty.")
 
@@ -1529,7 +1547,7 @@ class SchedulingService:
                     channels_with_text_matches.add(channel_id)
                     total_epg_matches += 1
                     title = self._program_event_title(program, match)
-                    timing = self._program_schedule_timing(program, minutes_before, now)
+                    timing = self._program_schedule_timing(program, minutes_before, now, timing_direction)
                     timing_state = timing['state']
                     if timing_state == 'missing_time':
                         missing_time_matches += 1
@@ -1710,6 +1728,7 @@ class SchedulingService:
                 rule_name = rule.get('name', rule_id)
                 regex_pattern = rule.get('regex_pattern')
                 minutes_before = rule.get('minutes_before', 5)
+                timing_direction = self._normalize_timing_direction(rule.get('timing_direction'))
                 rule_events_start_index = len(events_to_add)
                 created_before_rule = created_count
 
@@ -1788,7 +1807,7 @@ class SchedulingService:
                         title = self._program_event_title(program, match)
                         matched_count += 1
 
-                        timing = self._program_schedule_timing(program, minutes_before, now)
+                        timing = self._program_schedule_timing(program, minutes_before, now, timing_direction)
                         timing_state = timing['state']
                         if timing_state == 'missing_time':
                             missing_time_count += 1
@@ -1829,6 +1848,7 @@ class SchedulingService:
                                 'program_title': title,
                                 'program_end_time': program_end,
                                 'minutes_before': minutes_before,
+                                'timing_direction': timing_direction,
                                 'check_time': check_time.isoformat(),
                                 'tvg_id': program.get('tvg_id') or tvg_id,
                                 'schedule_type': rule.get('schedule_type', 'check'),
@@ -1867,6 +1887,7 @@ class SchedulingService:
                             'program_start_time': program_start,
                             'program_end_time': program_end,
                             'minutes_before': minutes_before,
+                            'timing_direction': timing_direction,
                             'check_time': check_time.isoformat(),
                             'tvg_id': program.get('tvg_id') or tvg_id,
                             'schedule_type': rule.get('schedule_type', 'check'),
@@ -2471,6 +2492,7 @@ class SchedulingService:
                 'channel_group_ids': rule.get('channel_group_ids', []),
                 'regex_pattern': rule.get('regex_pattern'),
                 'minutes_before': rule.get('minutes_before', 5),
+                'timing_direction': self._normalize_timing_direction(rule.get('timing_direction')),
                 'max_events_per_run': self._rule_max_events_per_run(rule),
             }
             if len(exported_rule['channel_ids']) == 1 and not exported_rule['channel_group_ids']:
@@ -2533,6 +2555,9 @@ class SchedulingService:
                                 existing_group_ids == import_group_ids_set):
                             matching_rule['name'] = import_name
                             matching_rule['minutes_before'] = rule_data.get('minutes_before', 5)
+                            matching_rule['timing_direction'] = self._normalize_timing_direction(
+                                rule_data.get('timing_direction')
+                            )
                             matching_rule['max_events_per_run'] = self._normalize_rule_max_events_per_run(
                                 rule_data.get('max_events_per_run')
                             )
