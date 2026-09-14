@@ -2,6 +2,10 @@ name: Frontend Audit Fix (one-off)
 
 on:
   workflow_dispatch: {}
+  push:
+    branches: ["main"]
+    paths:
+      - ".github/workflows/frontend-audit-fix-temp.yml"
 
 permissions:
   contents: write
