@@ -160,7 +160,6 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "include_leagues": [],
     "exclude_leagues": [],
     "probe_only_mode": False,
-    "teamarr_order_now_delay_seconds": 3,
 }
 TEAMARR_ORDER_NOW_ENDPOINT = "/api/v1/settings/stream-ordering/apply"
 TEAMARR_ORDER_NOW_MIN_INTERVAL_SECONDS = 5.0
@@ -173,7 +172,6 @@ INT_BOUNDS = {
     "post_start_grace_minutes": (0, 120),
     "max_concurrent_checks": (1, 10),
     "event_cooldown_minutes": (1, 10080),
-    "teamarr_order_now_delay_seconds": (0, 30),
 }
 
 
@@ -343,12 +341,10 @@ class TeamarrPreflightService:
         static_team_scan_budget_seconds: float = STATIC_TEAM_SCAN_BUDGET_SECONDS,
         stop_wait_seconds: float = PREFLIGHT_STOP_WAIT_SECONDS,
         clock: Callable[[], float] = time.time,
-        sleep_fn: Callable[[float], None] = time.sleep,
     ) -> None:
         self.config_file = config_file
         self.http_get = http_get
         self.http_post = http_post
-        self.sleep_fn = sleep_fn
         self.udi_provider = udi_provider
         self.stream_checker_provider = stream_checker_provider or self._default_stream_checker_provider
         self.automation_config_provider = automation_config_provider or self._default_automation_config_provider
@@ -1328,6 +1324,35 @@ class TeamarrPreflightService:
         response.raise_for_status()
         return response.json()
 
+    def _post_teamarr_order_now_once(self, base_url: str, headers: Dict[str, str]) -> Dict[str, Any]:
+        """Issue exactly one POST to Teamarr's order-now endpoint."""
+        try:
+            response = self.http_post(
+                f"{base_url.rstrip('/')}{TEAMARR_ORDER_NOW_ENDPOINT}",
+                headers=headers,
+                timeout=30.0,
+            )
+        except Exception as exc:
+            logger.warning("Teamarr order-now request failed: %s", exc)
+            return {"success": False, "error": "Teamarr order-now request failed", "code": "request_failed"}
+
+        if response.status_code == 409:
+            return {
+                "success": False,
+                "error": "Teamarr generation already in progress",
+                "code": "generation_in_progress",
+            }
+
+        try:
+            response.raise_for_status()
+            payload = response.json()
+        except Exception as exc:
+            logger.warning("Teamarr order-now returned an unexpected response: %s", exc)
+            return {"success": False, "error": "Teamarr order-now returned an unexpected response", "code": "bad_response"}
+
+        logger.info("Teamarr order-now applied: %s", payload)
+        return {"success": True, **(payload if isinstance(payload, dict) else {})}
+
     def trigger_teamarr_order_now(self, config: Dict[str, Any], *, force: bool = False) -> Dict[str, Any]:
         """Ask Teamarr to re-sort every managed channel by its own ordering rules.
 
@@ -1338,6 +1363,21 @@ class TeamarrPreflightService:
         channel, so callers should not invoke this more than needed; a short
         cooldown collapses bursts from several preflight checks completing close
         together unless ``force`` is set (used by the manual "Order now" action).
+
+        Teamarr's own ordering pass (as of the version this was verified
+        against) loads each channel's streams into memory, *then* refreshes
+        stream_stats from Dispatcharr and writes that into its database —
+        but it never re-reads the streams it already loaded, so it scores
+        using whatever was cached before its own refresh. The freshly
+        probed stats land in Teamarr's database either way, just too late
+        for that same run to use them. Calling the endpoint twice back to
+        back works around this: the first call's refresh is what the
+        second call's own (now up to date) in-memory load picks up, so the
+        second call actually scores against the stats this probe just
+        wrote. No delay is needed between the two calls — Teamarr's stats
+        write commits before it responds, and its own database read for
+        the second call happens after that response is received. Revert
+        to a single call if Teamarr fixes this upstream.
         """
         base_url = str(config.get("teamarr_base_url") or "").strip()
         if not base_url:
@@ -1355,43 +1395,15 @@ class TeamarrPreflightService:
         if api_key:
             headers[str(config.get("api_key_header") or DEFAULT_CONFIG["api_key_header"])] = api_key
 
-        try:
-            response = self.http_post(
-                f"{base_url.rstrip('/')}{TEAMARR_ORDER_NOW_ENDPOINT}",
-                headers=headers,
-                timeout=30.0,
-            )
-        except Exception as exc:
-            logger.warning("Teamarr order-now request failed: %s", exc)
-            result = {"success": False, "error": "Teamarr order-now request failed", "code": "request_failed"}
+        priming_result = self._post_teamarr_order_now_once(base_url, headers)
+        if not priming_result.get("success"):
             with self._lock:
-                self._last_teamarr_order_result = result
-            return result
+                self._last_teamarr_order_result = priming_result
+            return priming_result
 
-        if response.status_code == 409:
-            result = {
-                "success": False,
-                "error": "Teamarr generation already in progress",
-                "code": "generation_in_progress",
-            }
-            with self._lock:
-                self._last_teamarr_order_result = result
-            return result
-
-        try:
-            response.raise_for_status()
-            payload = response.json()
-        except Exception as exc:
-            logger.warning("Teamarr order-now returned an unexpected response: %s", exc)
-            result = {"success": False, "error": "Teamarr order-now returned an unexpected response", "code": "bad_response"}
-            with self._lock:
-                self._last_teamarr_order_result = result
-            return result
-
-        result = {"success": True, **(payload if isinstance(payload, dict) else {})}
+        result = self._post_teamarr_order_now_once(base_url, headers)
         with self._lock:
             self._last_teamarr_order_result = result
-        logger.info("Teamarr order-now applied: %s", payload)
         return result
 
     def _events_with_catalog_sports(
@@ -2335,40 +2347,15 @@ class TeamarrPreflightService:
     def _trigger_teamarr_order_now_after_probe(self, event: Dict[str, Any]) -> None:
         try:
             config = self.get_config(include_secret=True)
+            order_result = self.trigger_teamarr_order_now(config)
+            if not order_result.get("success") and not order_result.get("skipped"):
+                self._record_event(
+                    "teamarr_order_now_failed",
+                    event,
+                    {"error": order_result.get("error"), "code": order_result.get("code")},
+                )
         except Exception as exc:
             logger.warning("Could not trigger Teamarr order-now after probe: %s", exc)
-            return
-
-        delay_seconds = max(0.0, float(config.get("teamarr_order_now_delay_seconds") or 0))
-
-        def _fire() -> None:
-            try:
-                if delay_seconds > 0:
-                    self.sleep_fn(delay_seconds)
-                order_result = self.trigger_teamarr_order_now(config)
-                if not order_result.get("success") and not order_result.get("skipped"):
-                    self._record_event(
-                        "teamarr_order_now_failed",
-                        event,
-                        {"error": order_result.get("error"), "code": order_result.get("code")},
-                    )
-            except Exception as exc:
-                logger.warning("Could not trigger Teamarr order-now after probe: %s", exc)
-
-        if delay_seconds > 0:
-            # A short settle delay lets Dispatcharr finish persisting the
-            # stats this probe just wrote before Teamarr re-reads them —
-            # without it, Teamarr's bulk stats fetch can race the write and
-            # sort by whatever it had cached beforehand. Runs off-thread so
-            # it never blocks the check-completion path (direct thread or
-            # the stream checker's queue worker) that called us.
-            threading.Thread(
-                target=_fire,
-                name="TeamarrOrderNowDelay",
-                daemon=True,
-            ).start()
-        else:
-            _fire()
 
     def _run_check(self, key: str, event: Dict[str, Any], config: Dict[str, Any]) -> None:
         try:

@@ -335,8 +335,6 @@ class TeamarrPreflightServiceTest(unittest.TestCase):
         http_get = http_get or Mock(return_value=FakeResponse(events))
         http_post = http_post or Mock(return_value=FakeResponse({"channels_reordered": 0, "streams_reordered": 0}))
         db = db or FakeDb()
-        service_kwargs = {"sleep_fn": lambda seconds: None}
-        service_kwargs.update(service_options or {})
         service = TeamarrPreflightService(
             config_file=self.config_file,
             http_get=http_get,
@@ -347,7 +345,7 @@ class TeamarrPreflightServiceTest(unittest.TestCase):
             automation_status_provider=lambda: automation_status,
             db_provider=lambda: db,
             clock=lambda: FIXED_NOW,
-            **service_kwargs,
+            **(service_options or {}),
         )
         service.update_config({
             "teamarr_base_url": "http://teamarr.test",
@@ -388,10 +386,6 @@ class TeamarrPreflightServiceTest(unittest.TestCase):
         self.assertFalse(normalize_config({"defer_during_active_checks": True})["queue_during_active_checks"])
         self.assertTrue(normalize_config({"defer_during_active_checks": False})["queue_during_active_checks"])
         self.assertTrue(normalize_config({"queue_during_active_checks": True})["queue_during_active_checks"])
-        self.assertEqual(normalize_config({})["teamarr_order_now_delay_seconds"], 3)
-        self.assertEqual(normalize_config({"teamarr_order_now_delay_seconds": 99})["teamarr_order_now_delay_seconds"], 30)
-        self.assertEqual(normalize_config({"teamarr_order_now_delay_seconds": -5})["teamarr_order_now_delay_seconds"], 0)
-        self.assertEqual(normalize_config({"teamarr_order_now_delay_seconds": 0})["teamarr_order_now_delay_seconds"], 0)
 
         service, _, _ = self.make_service([])
         public_config = service.get_config()
@@ -1044,58 +1038,16 @@ class TeamarrPreflightServiceTest(unittest.TestCase):
         self.assertTrue(kwargs["probe_only"])
 
         deadline = time.time() + 2
-        while time.time() < deadline and not http_post.called:
+        while time.time() < deadline and http_post.call_count < 2:
             time.sleep(0.01)
-        self.assertTrue(http_post.called)
-        call = http_post.call_args_list[0]
-        self.assertEqual(call[0][0], "http://teamarr.test/api/v1/settings/stream-ordering/apply")
-        self.assertEqual(call.kwargs["headers"]["X-Teamarr-Key"], "secret")
-
-    def test_probe_only_mode_delays_order_now_by_configured_settle_seconds(self):
-        checker = FakeChecker()
-        http_post = Mock(return_value=FakeResponse({"channels_reordered": 1}))
-        sleep_calls = []
-
-        service, _, _ = self.make_service(
-            [make_event()],
-            checker=checker,
-            http_post=http_post,
-            service_options={"sleep_fn": lambda seconds: sleep_calls.append(seconds)},
-        )
-        service.update_config({"probe_only_mode": True, "teamarr_order_now_delay_seconds": 7})
-
-        result = service.run_once(force=True)
-        self.assertTrue(result["success"])
-
-        deadline = time.time() + 2
-        while time.time() < deadline and not http_post.called:
-            time.sleep(0.01)
-
-        self.assertTrue(http_post.called)
-        self.assertEqual(sleep_calls, [7])
-
-    def test_probe_only_mode_zero_delay_triggers_order_now_synchronously(self):
-        checker = FakeChecker()
-        http_post = Mock(return_value=FakeResponse({"channels_reordered": 1}))
-        sleep_calls = []
-
-        service, _, _ = self.make_service(
-            [make_event()],
-            checker=checker,
-            http_post=http_post,
-            service_options={"sleep_fn": lambda seconds: sleep_calls.append(seconds)},
-        )
-        service.update_config({"probe_only_mode": True, "teamarr_order_now_delay_seconds": 0})
-
-        result = service.run_once(force=True)
-        self.assertTrue(result["success"])
-
-        deadline = time.time() + 2
-        while time.time() < deadline and not http_post.called:
-            time.sleep(0.01)
-
-        self.assertTrue(http_post.called)
-        self.assertEqual(sleep_calls, [])
+        # Teamarr's own ordering pass scores against streams it loaded before
+        # its own stats refresh, so one call primes that refresh and a second,
+        # immediate call is what actually applies the fresh stats (see
+        # trigger_teamarr_order_now's docstring).
+        self.assertEqual(http_post.call_count, 2)
+        for call in http_post.call_args_list:
+            self.assertEqual(call[0][0], "http://teamarr.test/api/v1/settings/stream-ordering/apply")
+            self.assertEqual(call.kwargs["headers"]["X-Teamarr-Key"], "secret")
 
     def test_probe_only_mode_off_does_not_request_probe_only_or_trigger_order_now(self):
         checker = FakeChecker()
@@ -1133,12 +1085,10 @@ class TeamarrPreflightServiceTest(unittest.TestCase):
         }
         service.record_queued_check_result(metadata, {"success": True, "stats": {}})
 
-        deadline = time.time() + 2
-        while time.time() < deadline and not http_post.called:
-            time.sleep(0.01)
-        http_post.assert_called_once()
-        call = http_post.call_args_list[0]
-        self.assertEqual(call[0][0], "http://teamarr.test/api/v1/settings/stream-ordering/apply")
+        # One call primes Teamarr's stats refresh, the second applies it.
+        self.assertEqual(http_post.call_count, 2)
+        for call in http_post.call_args_list:
+            self.assertEqual(call[0][0], "http://teamarr.test/api/v1/settings/stream-ordering/apply")
 
     def test_queued_check_completion_without_probe_only_does_not_trigger_order_now(self):
         http_post = Mock(return_value=FakeResponse({"channels_reordered": 1}))
@@ -2217,6 +2167,26 @@ class TeamarrOrderNowTest(unittest.TestCase):
         self.assertTrue(result["success"])
         self.assertEqual(result["channels_reordered"], 3)
         self.assertEqual(result["streams_reordered"], 9)
+        # One call primes Teamarr's stats refresh, a second applies it —
+        # Teamarr's ordering pass scores against streams it loaded before its
+        # own Dispatcharr stats refresh, so only a second, immediate call
+        # actually sees the fresh stats that refresh just wrote.
+        self.assertEqual(http_post.call_count, 2)
+
+    def test_double_call_returns_the_second_calls_result(self):
+        # The first call's response (the priming run, scored on stale stats)
+        # must never be what callers see — only the second call's response
+        # (scored after Teamarr's own refresh has landed) is meaningful.
+        http_post = Mock(side_effect=[
+            FakeResponse({"channels_reordered": 0, "streams_reordered": 0}),
+            FakeResponse({"channels_reordered": 4, "streams_reordered": 11}),
+        ])
+        service = self.make_service(http_post)
+        result = service.trigger_teamarr_order_now({"teamarr_base_url": "http://teamarr.test"}, force=True)
+        self.assertTrue(result["success"])
+        self.assertEqual(result["channels_reordered"], 4)
+        self.assertEqual(result["streams_reordered"], 11)
+        self.assertEqual(http_post.call_count, 2)
 
     def test_generation_in_progress_conflict_is_reported_not_raised(self):
         http_post = Mock(return_value=FakeResponse({"detail": "Generation already in progress"}, status_code=409))
@@ -2224,6 +2194,9 @@ class TeamarrOrderNowTest(unittest.TestCase):
         result = service.trigger_teamarr_order_now({"teamarr_base_url": "http://teamarr.test"}, force=True)
         self.assertFalse(result["success"])
         self.assertEqual(result["code"], "generation_in_progress")
+        # A failed priming call means nothing was refreshed for a second call
+        # to pick up, so the second call is skipped rather than wasted.
+        self.assertEqual(http_post.call_count, 1)
 
     def test_debounces_rapid_repeat_calls_unless_forced(self):
         http_post = Mock(return_value=FakeResponse({"channels_reordered": 1}))
@@ -2235,11 +2208,11 @@ class TeamarrOrderNowTest(unittest.TestCase):
 
         self.assertTrue(first["success"])
         self.assertTrue(second.get("skipped"))
-        http_post.assert_called_once()
+        self.assertEqual(http_post.call_count, 2)
 
         third = service.trigger_teamarr_order_now(config, force=True)
         self.assertTrue(third["success"])
-        self.assertEqual(http_post.call_count, 2)
+        self.assertEqual(http_post.call_count, 4)
 
 
 if __name__ == "__main__":
