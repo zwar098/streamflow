@@ -339,6 +339,91 @@ class TestProgressTracking(unittest.TestCase):
         # ...but StreamFlow must not push its own order back to Dispatcharr.
         mock_update_order.assert_not_called()
 
+    @patch('stream_checker_service.fetch_channel_streams')
+    @patch('stream_checker_service.get_udi_manager')
+    @patch('stream_checker_service.get_automation_config_manager')
+    @patch('stream_checker_service._get_base_url')
+    def test_profile_stream_limit_actually_trims_the_channel(
+        self, mock_base_url, mock_get_automation_config, mock_get_udi, mock_fetch_streams
+    ):
+        """A profile's Stream Checking > Stream Limit must cap how many
+        streams stay assigned to the channel. The write-back guard that
+        preserves stream IDs missing from the UDI cache (to protect against
+        stale-cache drops) must not treat streams the limit deliberately
+        excluded as if they were merely uncached — otherwise every trimmed
+        stream gets silently added right back, and the limit never does
+        anything (the exact bug reported: 'no matter what number I set, all
+        streams still get assigned')."""
+        mock_base_url.return_value = "http://test:8000"
+
+        profile = {
+            'stream_checking': {
+                'enabled': True,
+                'stream_limit': 2,
+            },
+        }
+        mock_automation_config = MagicMock()
+        mock_automation_config.get_effective_configuration.return_value = {'profile': profile}
+        mock_get_automation_config.return_value = mock_automation_config
+
+        mock_udi = MagicMock()
+        mock_udi.get_channel_by_id.return_value = {
+            'id': 1,
+            'name': 'Test Channel',
+        }
+        mock_udi.get_m3u_accounts.return_value = []
+        mock_get_udi.return_value = mock_udi
+
+        streams = [
+            {'id': 1, 'name': 'Stream 1', 'url': 'http://test1', 'bitrate_kbps': 1000},
+            {'id': 2, 'name': 'Stream 2', 'url': 'http://test2', 'bitrate_kbps': 2000},
+            {'id': 3, 'name': 'Stream 3', 'url': 'http://test3', 'bitrate_kbps': 3000},
+            {'id': 4, 'name': 'Stream 4', 'url': 'http://test4', 'bitrate_kbps': 4000},
+        ]
+        mock_fetch_streams.return_value = streams
+
+        with patch('stream_checker_service.CONFIG_DIR', Path(self.temp_dir)):
+            service = StreamCheckerService()
+            service._require_quality_check_connectivity = Mock(return_value=None)
+
+            def fake_analyze_stream(stream, *args, **kwargs):
+                return {
+                    'stream_id': stream.get('id'),
+                    'stream_name': stream.get('name'),
+                    'stream_url': stream.get('url'),
+                    'resolution': '1920x1080',
+                    'fps': 30,
+                    'video_codec': 'h264',
+                    'audio_codec': 'aac',
+                    'bitrate_kbps': stream.get('bitrate_kbps'),
+                    'status': 'OK',
+                }
+
+            class FakeSmartScheduler:
+                def check_streams_with_limits(self, streams, check_function, **kwargs):
+                    return [check_function(stream) for stream in streams]
+
+            fake_scheduler = FakeSmartScheduler()
+
+            with patch('stream_checker_service.analyze_stream', side_effect=fake_analyze_stream), \
+                 patch(
+                     'apps.stream.concurrent_stream_limiter.get_smart_scheduler',
+                     return_value=fake_scheduler,
+                 ):
+                with patch('stream_checker_service.batch_update_stream_stats', return_value=(4, 0)), \
+                     patch('stream_checker_service.update_channel_streams', return_value=True) as mock_update_order:
+                    service._check_channel(1)
+
+        mock_update_order.assert_called_once()
+        written_stream_ids = mock_update_order.call_args[0][1]
+        self.assertEqual(
+            len(written_stream_ids), 2,
+            f"Stream Limit=2 should have capped the channel to 2 streams, "
+            f"but {len(written_stream_ids)} were written: {written_stream_ids}",
+        )
+        # The two highest-bitrate streams (3 and 4) should be the ones kept.
+        self.assertEqual(set(written_stream_ids), {3, 4})
+
 
 class TestLegacySequentialDelegation(unittest.TestCase):
     def test_legacy_sequential_entry_uses_exact_profile_scheduler(self):

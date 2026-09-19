@@ -5307,15 +5307,20 @@ class StreamCheckerService:
                 analyzed['sort_key'] = self._generate_stream_sort_key(analyzed, priority_m3u_ids, priority_mode)
                 
             analyzed_streams.sort(key=lambda x: x['sort_key'])
-            
+
             # Apply stream limit if configured in profile
+            stream_limit_excluded_ids: set = set()
             if stream_limit > 0 and len(analyzed_streams) > stream_limit:
                 removed_count = len(analyzed_streams) - stream_limit
                 logger.info(f"Applying profile stream limit: Keeping top {stream_limit} streams, removing {removed_count}")
+                stream_limit_excluded_ids = {
+                    s.get('stream_id') for s in analyzed_streams[stream_limit:]
+                    if s.get('stream_id') is not None
+                }
                 analyzed_streams = analyzed_streams[:stream_limit]
 
             report_analyzed_streams = list(analyzed_streams)
-            
+
             # Remove dead streams from the channel (if enabled in config)
             # Dead streams are checked during all channel checks (normal and global)
             # If they're still dead, they're removed; if revived, they remain
@@ -5325,7 +5330,7 @@ class StreamCheckerService:
                     analyzed_streams = [s for s in analyzed_streams if s.get('stream_id') not in dead_stream_ids]
                 else:
                     logger.info(f"⚠️ Found {len(dead_stream_ids)} dead streams in channel {channel_name}, but removal is disabled in config")
-            
+
             if revived_stream_ids:
                 logger.info(f"{len(revived_stream_ids)} streams were revived in channel {channel_name}")
 
@@ -5336,7 +5341,7 @@ class StreamCheckerService:
             )
             if abort_result:
                 return abort_result
-            
+
             # Update channel with reordered streams — unless probe_only is set, in
             # which case StreamFlow's own scoring/reordering is intentionally
             # skipped so an external orderer (e.g. Teamarr) can apply its own
@@ -5370,9 +5375,14 @@ class StreamCheckerService:
                 # were not returned by get_channel_streams() due to a stale UDI stream cache.
                 # Without this guard, a stale cache causes those streams to be silently dropped
                 # when the checker PATCHes the channel's stream list back to Dispatcharr.
+                #
+                # stream_limit_excluded_ids is unioned in here so streams the profile's
+                # Stream Limit deliberately cut are treated as accounted-for rather than
+                # "missing from cache" — otherwise this same preservation guard silently
+                # re-added every trimmed stream, defeating the limit entirely.
                 _uncached_ids = self._get_uncached_channel_stream_ids(
                     assigned_stream_ids,
-                    set(reordered_ids),
+                    set(reordered_ids) | stream_limit_excluded_ids,
                     dead_stream_removal_enabled,
                     dead_stream_ids,
                 )
