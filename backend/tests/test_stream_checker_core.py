@@ -424,6 +424,68 @@ class TestProgressTracking(unittest.TestCase):
         # The two highest-bitrate streams (3 and 4) should be the ones kept.
         self.assertEqual(set(written_stream_ids), {3, 4})
 
+    @patch('stream_checker_service.fetch_channel_streams')
+    @patch('stream_checker_service.get_udi_manager')
+    @patch('stream_checker_service._get_base_url')
+    def test_failed_dispatcharr_write_is_logged_not_silently_reported_as_success(
+        self, mock_base_url, mock_get_udi, mock_fetch_streams
+    ):
+        """update_channel_streams()'s return value was previously discarded
+        (captured as `_`), so a failed PATCH to Dispatcharr still produced a
+        "checked and streams reordered" success log — indistinguishable from
+        an actual success, and the reason a user could see a correct trim
+        computed in the logs while Dispatcharr's real stream list never
+        changed. The failure must now be logged and the false success log
+        must not fire."""
+        mock_base_url.return_value = "http://test:8000"
+
+        mock_udi = MagicMock()
+        mock_udi.get_channel_by_id.return_value = {'id': 1, 'name': 'Test Channel'}
+        mock_udi.get_m3u_accounts.return_value = []
+        mock_get_udi.return_value = mock_udi
+
+        mock_fetch_streams.return_value = [
+            {'id': 1, 'name': 'Stream 1', 'url': 'http://test1'},
+            {'id': 2, 'name': 'Stream 2', 'url': 'http://test2'},
+        ]
+
+        with patch('stream_checker_service.CONFIG_DIR', Path(self.temp_dir)):
+            service = StreamCheckerService()
+            service._require_quality_check_connectivity = Mock(return_value=None)
+
+            def fake_analyze_stream(stream, *args, **kwargs):
+                return {
+                    'stream_id': stream.get('id'),
+                    'stream_name': stream.get('name'),
+                    'stream_url': stream.get('url'),
+                    'resolution': '1920x1080',
+                    'fps': 30,
+                    'video_codec': 'h264',
+                    'audio_codec': 'aac',
+                    'bitrate_kbps': 5000,
+                    'status': 'OK',
+                }
+
+            class FakeSmartScheduler:
+                def check_streams_with_limits(self, streams, check_function, **kwargs):
+                    return [check_function(stream) for stream in streams]
+
+            fake_scheduler = FakeSmartScheduler()
+
+            with patch('stream_checker_service.analyze_stream', side_effect=fake_analyze_stream), \
+                 patch(
+                     'apps.stream.concurrent_stream_limiter.get_smart_scheduler',
+                     return_value=fake_scheduler,
+                 ):
+                with patch('stream_checker_service.batch_update_stream_stats', return_value=(2, 0)), \
+                     patch('stream_checker_service.update_channel_streams', return_value=False):
+                    with self.assertLogs('apps.stream.stream_checker_service', level='INFO') as logs:
+                        service._check_channel(1)
+
+        joined = "\n".join(logs.output)
+        self.assertIn("write-back to Dispatcharr failed", joined)
+        self.assertNotIn("checked and streams reordered", joined)
+
 
 class TestLegacySequentialDelegation(unittest.TestCase):
     def test_legacy_sequential_entry_uses_exact_profile_scheduler(self):

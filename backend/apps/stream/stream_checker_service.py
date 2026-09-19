@@ -5416,7 +5416,7 @@ class StreamCheckerService:
                             queue_entry_token=queue_entry_token,
                         )
 
-                update_authorized, _ = self._run_channel_side_effect_if_authorized(
+                update_authorized, update_succeeded = self._run_channel_side_effect_if_authorized(
                     channel_id,
                     queue_entry_token,
                     lambda: update_channel_streams(
@@ -5432,6 +5432,18 @@ class StreamCheckerService:
                         channel_id,
                         channel_name,
                         queue_entry_token=queue_entry_token,
+                    )
+                if not update_succeeded:
+                    # update_channel_streams() returned False (e.g. Dispatcharr
+                    # rejected the PATCH or returned an unexpected status). Without
+                    # this check the failure was silently discarded and the "checked
+                    # and reordered" log below fired regardless, claiming success
+                    # for a channel whose stream list in Dispatcharr never changed.
+                    logger.error(
+                        f"✗ Channel {channel_name} (id={channel_id}) stream order "
+                        f"write-back to Dispatcharr failed — channel still shows its "
+                        f"previous stream list. See the update_channel_streams warning "
+                        f"above for the specific cause."
                     )
 
                 # Verify the update
@@ -5457,7 +5469,8 @@ class StreamCheckerService:
                 else:
                     logger.debug(f"Skipped verification for channel {channel_name} (disabled in config)")
 
-                logger.info(f"✓ Channel {channel_name} checked and streams reordered (parallel mode)")
+                if update_succeeded:
+                    logger.info(f"✓ Channel {channel_name} checked and streams reordered (parallel mode)")
             
             # Generate detailed stream stats for return value and changelog
             try:
