@@ -2,13 +2,14 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { Button } from '@/components/ui/button.jsx'
 import { Checkbox } from '@/components/ui/checkbox.jsx'
 import { Badge } from '@/components/ui/badge.jsx'
+import { Input } from '@/components/ui/input.jsx'
 import { Label } from '@/components/ui/label.jsx'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select.jsx'
 import { Separator } from '@/components/ui/separator.jsx'
 import { Switch } from '@/components/ui/switch.jsx'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip.jsx'
 import { useToast } from '@/hooks/use-toast.js'
-import { channelsAPI, automationAPI } from '@/services/api.js'
+import { channelsAPI, automationAPI, streamLimitAPI } from '@/services/api.js'
 import { getCachedChannelLogoUrl, setCachedChannelLogoUrl } from '@/services/channelCache.js'
 import { Plus, Trash2, Loader2, Eye, ChevronDown, Activity, Calendar, CalendarClock, Edit, Zap } from 'lucide-react'
 import {
@@ -313,6 +314,98 @@ function ActiveProfileLines({ activeProfile }) {
         <span className="text-muted-foreground">EPG Profile: </span>
         {renderEpg()}
       </p>
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// StreamLimitControl — per-channel override for the max streams kept
+// assigned after a health check. Falls back to the group default, then the
+// automation profile's own setting, when left blank.
+// ---------------------------------------------------------------------------
+function StreamLimitControl({ channelId }) {
+  const [value, setValue] = useState('')
+  const [loading, setLoading] = useState(true)
+  const [saving, setSaving] = useState(false)
+  const { toast } = useToast()
+
+  useEffect(() => {
+    let cancelled = false
+    setLoading(true)
+    streamLimitAPI.getChannelStreamLimit(channelId)
+      .then((res) => {
+        if (cancelled) return
+        const limit = res.data?.stream_limit
+        setValue(limit === null || limit === undefined ? '' : String(limit))
+      })
+      .catch(() => { if (!cancelled) setValue('') })
+      .finally(() => { if (!cancelled) setLoading(false) })
+    return () => { cancelled = true }
+  }, [channelId])
+
+  const handleSave = async () => {
+    if (value === '') return
+    setSaving(true)
+    try {
+      await streamLimitAPI.setChannelStreamLimit(channelId, Number(value))
+      toast({ title: 'Success', description: 'Stream limit updated' })
+    } catch {
+      toast({ title: 'Error', description: 'Failed to update stream limit', variant: 'destructive' })
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const handleClear = async () => {
+    setSaving(true)
+    try {
+      await streamLimitAPI.deleteChannelStreamLimit(channelId)
+      setValue('')
+      toast({ title: 'Success', description: 'Stream limit override cleared' })
+    } catch {
+      toast({ title: 'Error', description: 'Failed to clear stream limit', variant: 'destructive' })
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <div className="flex items-center justify-between gap-4">
+      <div>
+        <Label className="text-sm font-medium">Stream Limit</Label>
+        <p className="text-xs text-muted-foreground">
+          Max streams kept assigned to this channel after checking. Leave blank to fall back to the group default, then the automation profile's setting.
+        </p>
+      </div>
+      <div className="flex items-center gap-2 shrink-0">
+        <Input
+          type="number"
+          min="0"
+          className="h-8 w-20 text-xs"
+          placeholder="Unset"
+          value={value}
+          disabled={loading || saving}
+          onChange={(e) => setValue(e.target.value)}
+        />
+        <Button
+          size="sm"
+          variant="outline"
+          className="h-8 text-xs"
+          disabled={loading || saving || value === ''}
+          onClick={handleSave}
+        >
+          Save
+        </Button>
+        <Button
+          size="sm"
+          variant="ghost"
+          className="h-8 text-xs"
+          disabled={loading || saving}
+          onClick={handleClear}
+        >
+          Clear
+        </Button>
+      </div>
     </div>
   )
 }
@@ -641,6 +734,10 @@ export function RegexTableRow({
               />
             </div>
           )}
+
+          <Separator />
+
+          <StreamLimitControl channelId={channel.id} />
 
           <Separator />
 

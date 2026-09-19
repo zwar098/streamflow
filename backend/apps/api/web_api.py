@@ -42,6 +42,7 @@ from apps.channels.channel_order_manager import get_channel_order_manager
 from apps.channels.repository import UdiChannelRepository
 from apps.channels.service import ChannelService
 from apps.automation.automation_config_manager import get_automation_config_manager
+from apps.automation.stream_limit_config import get_stream_limit_config
 from apps.api.channel_handlers import (
     get_channel_groups_response,
     get_channel_logo_cached_response,
@@ -73,6 +74,15 @@ from apps.api.regex_handlers import (
     update_group_match_settings_response,
     update_regex_global_settings_response,
     upsert_group_regex_config_response,
+)
+from apps.api.stream_limit_handlers import (
+    bulk_set_channel_stream_limits_response,
+    delete_channel_stream_limit_response,
+    delete_group_stream_limit_response,
+    get_channel_stream_limit_response,
+    get_group_stream_limit_response,
+    set_channel_stream_limit_response,
+    set_group_stream_limit_response,
 )
 from apps.api.automation_handlers import (
     assign_automation_profile_channel_response,
@@ -962,6 +972,71 @@ def update_group_match_settings(group_id):
         payload=request.get_json(silent=True),
         get_regex_matcher=get_regex_matcher,
     )
+
+@app.route('/api/channels/<channel_id>/stream-limit', methods=['GET'])
+def get_channel_stream_limit(channel_id):
+    """Get the stream limit override for a channel."""
+    return get_channel_stream_limit_response(
+        channel_id=channel_id,
+        get_stream_limit_config=get_stream_limit_config,
+    )
+
+
+@app.route('/api/channels/<channel_id>/stream-limit', methods=['POST'])
+def set_channel_stream_limit(channel_id):
+    """Set the stream limit override for a channel."""
+    return set_channel_stream_limit_response(
+        channel_id=channel_id,
+        payload=request.get_json(silent=True),
+        get_stream_limit_config=get_stream_limit_config,
+    )
+
+
+@app.route('/api/channels/<channel_id>/stream-limit', methods=['DELETE'])
+def delete_channel_stream_limit(channel_id):
+    """Clear the stream limit override for a channel."""
+    return delete_channel_stream_limit_response(
+        channel_id=channel_id,
+        get_stream_limit_config=get_stream_limit_config,
+    )
+
+
+@app.route('/api/channels/groups/<int:group_id>/stream-limit', methods=['GET'])
+def get_group_stream_limit(group_id):
+    """Get the default stream limit override for a channel group."""
+    return get_group_stream_limit_response(
+        group_id=group_id,
+        get_stream_limit_config=get_stream_limit_config,
+    )
+
+
+@app.route('/api/channels/groups/<int:group_id>/stream-limit', methods=['POST'])
+def set_group_stream_limit(group_id):
+    """Set the default stream limit override for a channel group."""
+    return set_group_stream_limit_response(
+        group_id=group_id,
+        payload=request.get_json(silent=True),
+        get_stream_limit_config=get_stream_limit_config,
+    )
+
+
+@app.route('/api/channels/groups/<int:group_id>/stream-limit', methods=['DELETE'])
+def delete_group_stream_limit(group_id):
+    """Clear the default stream limit override for a channel group."""
+    return delete_group_stream_limit_response(
+        group_id=group_id,
+        get_stream_limit_config=get_stream_limit_config,
+    )
+
+
+@app.route('/api/channels/stream-limit/bulk', methods=['POST'])
+def bulk_set_channel_stream_limits():
+    """Set the same stream limit override across multiple channels."""
+    return bulk_set_channel_stream_limits_response(
+        payload=request.get_json(silent=True),
+        get_stream_limit_config=get_stream_limit_config,
+    )
+
 
 @app.route('/api/regex-patterns/bulk', methods=['POST'])
 @app.route('/api/v1/regex-patterns/bulk', methods=['POST'])

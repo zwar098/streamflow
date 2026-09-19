@@ -13,7 +13,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs.j
 import { Alert, AlertDescription } from '@/components/ui/alert.jsx'
 import { Separator } from '@/components/ui/separator.jsx'
 import { useToast } from '@/hooks/use-toast.js'
-import { channelsAPI, regexAPI, streamCheckerAPI, channelOrderAPI, automationAPI, m3uAPI } from '@/services/api.js'
+import { channelsAPI, regexAPI, streamCheckerAPI, channelOrderAPI, automationAPI, m3uAPI, streamLimitAPI } from '@/services/api.js'
 import { CheckCircle, Edit, Plus, Trash2, Loader2, Search, X, Download, Upload, GripVertical, Save, RotateCcw, ArrowUpDown, MoreVertical, Eye, ChevronDown, Info, Activity, Edit2, ArrowRight, Clock, Calendar, CalendarClock, UserRound } from 'lucide-react'
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger, DropdownMenuCheckboxItem } from '@/components/ui/dropdown-menu.jsx'
 import { Switch } from '@/components/ui/switch.jsx'
@@ -283,6 +283,9 @@ function GroupAssignMatchingDialog({ open, onOpenChange, group, initialConfig, o
   const [matchByTvgId, setMatchByTvgId] = useState(false)
   const [patterns, setPatterns] = useState([])
   const [newPattern, setNewPattern] = useState('')
+  const [streamLimit, setStreamLimit] = useState('')
+  const [streamLimitLoading, setStreamLimitLoading] = useState(false)
+  const [streamLimitSaving, setStreamLimitSaving] = useState(false)
   const { toast } = useToast()
 
   useEffect(() => {
@@ -298,6 +301,47 @@ function GroupAssignMatchingDialog({ open, onOpenChange, group, initialConfig, o
     setPatterns(normalized)
     setNewPattern('')
   }, [open, initialConfig])
+
+  useEffect(() => {
+    if (!open || !group?.id) return
+    let cancelled = false
+    setStreamLimitLoading(true)
+    streamLimitAPI.getGroupStreamLimit(group.id)
+      .then((res) => {
+        if (cancelled) return
+        const limit = res.data?.stream_limit
+        setStreamLimit(limit === null || limit === undefined ? '' : String(limit))
+      })
+      .catch(() => { if (!cancelled) setStreamLimit('') })
+      .finally(() => { if (!cancelled) setStreamLimitLoading(false) })
+    return () => { cancelled = true }
+  }, [open, group?.id])
+
+  const handleSaveStreamLimit = async () => {
+    if (streamLimit === '') return
+    setStreamLimitSaving(true)
+    try {
+      await streamLimitAPI.setGroupStreamLimit(group.id, Number(streamLimit))
+      toast({ title: 'Success', description: `Stream limit updated for group "${group?.name}"` })
+    } catch {
+      toast({ title: 'Error', description: 'Failed to update group stream limit', variant: 'destructive' })
+    } finally {
+      setStreamLimitSaving(false)
+    }
+  }
+
+  const handleClearStreamLimit = async () => {
+    setStreamLimitSaving(true)
+    try {
+      await streamLimitAPI.deleteGroupStreamLimit(group.id)
+      setStreamLimit('')
+      toast({ title: 'Success', description: `Stream limit override cleared for group "${group?.name}"` })
+    } catch {
+      toast({ title: 'Error', description: 'Failed to clear group stream limit', variant: 'destructive' })
+    } finally {
+      setStreamLimitSaving(false)
+    }
+  }
 
   const handleAddPattern = () => {
     const trimmed = (newPattern || '').trim()
@@ -389,6 +433,44 @@ function GroupAssignMatchingDialog({ open, onOpenChange, group, initialConfig, o
               </div>
             )}
           </div>
+
+          <div className="flex items-center justify-between gap-4 p-3 rounded-md border bg-muted/40">
+            <div>
+              <p className="font-medium text-sm">Stream Limit (group default)</p>
+              <p className="text-xs text-muted-foreground">
+                Max streams kept assigned to channels in this group after checking. Used when a channel has no stream limit override of its own. Falls back to the automation profile's setting if left blank.
+              </p>
+            </div>
+            <div className="flex items-center gap-2 shrink-0">
+              <Input
+                type="number"
+                min="0"
+                className="h-8 w-20 text-xs"
+                placeholder="Unset"
+                value={streamLimit}
+                disabled={streamLimitLoading || streamLimitSaving}
+                onChange={(e) => setStreamLimit(e.target.value)}
+              />
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-8 text-xs"
+                disabled={streamLimitLoading || streamLimitSaving || streamLimit === ''}
+                onClick={handleSaveStreamLimit}
+              >
+                Save
+              </Button>
+              <Button
+                size="sm"
+                variant="ghost"
+                className="h-8 text-xs"
+                disabled={streamLimitLoading || streamLimitSaving}
+                onClick={handleClearStreamLimit}
+              >
+                Clear
+              </Button>
+            </div>
+          </div>
         </div>
 
         <DialogFooter className="justify-between">
@@ -459,6 +541,9 @@ export default function ChannelConfiguration() {
   const [sortByGroup, setSortByGroup] = useState(false)
   const [bulkDialogOpen, setBulkDialogOpen] = useState(false)
   const [bulkPeriodEditOpen, setBulkPeriodEditOpen] = useState(false)
+  const [bulkStreamLimitDialogOpen, setBulkStreamLimitDialogOpen] = useState(false)
+  const [bulkStreamLimitValue, setBulkStreamLimitValue] = useState('')
+  const [savingBulkStreamLimit, setSavingBulkStreamLimit] = useState(false)
   const [bulkPattern, setBulkPattern] = useState('')
 
   // Automation Profile state
@@ -1861,6 +1946,34 @@ export default function ChannelConfiguration() {
     }
   }
 
+  const handleBulkSetStreamLimit = async () => {
+    if (selectedChannels.size === 0 || bulkStreamLimitValue === '') return
+
+    setSavingBulkStreamLimit(true)
+    try {
+      const response = await streamLimitAPI.bulkSetChannelStreamLimits(
+        Array.from(selectedChannels),
+        Number(bulkStreamLimitValue)
+      )
+
+      toast({
+        title: "Success",
+        description: response.data.message || `Updated stream limit for ${response.data.success_count} channels`
+      })
+
+      setBulkStreamLimitDialogOpen(false)
+      setBulkStreamLimitValue('')
+    } catch (err) {
+      toast({
+        title: "Error",
+        description: err.response?.data?.error || "Failed to update stream limit",
+        variant: "destructive"
+      })
+    } finally {
+      setSavingBulkStreamLimit(false)
+    }
+  }
+
   const handleDeleteSingleCommonPattern = async (patternInfo) => {
     try {
       // Delete this pattern from all selected channels
@@ -2510,6 +2623,27 @@ export default function ChannelConfiguration() {
                           <DropdownMenuItem onClick={() => handleBulkMatchSettings(false)}>Disable</DropdownMenuItem>
                         </DropdownMenuContent>
                       </DropdownMenu>
+                    </div>
+
+                    <Separator orientation="vertical" className="h-6 hidden lg:block" />
+
+                    {/* Section: Stream Limit */}
+                    <div className="flex items-center gap-3">
+                      <div className="text-[10px] font-bold text-muted-foreground uppercase tracking-wider">Stream Limit</div>
+                      <Tooltip>
+                        <TooltipTrigger asChild>
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            onClick={() => setBulkStreamLimitDialogOpen(true)}
+                            disabled={selectedChannels.size === 0}
+                            className="h-8 px-2"
+                          >
+                            <Edit2 className="h-4 w-4" />
+                          </Button>
+                        </TooltipTrigger>
+                        <TooltipContent><p>Set Stream Limit</p></TooltipContent>
+                      </Tooltip>
                     </div>
 
                     <Separator orientation="vertical" className="h-6 hidden lg:block" />
@@ -3455,6 +3589,45 @@ export default function ChannelConfiguration() {
         </Dialog>
 
         {/* Bulk Pattern Assignment Dialog */}
+        <Dialog open={bulkStreamLimitDialogOpen} onOpenChange={setBulkStreamLimitDialogOpen}>
+          <DialogContent className="sm:max-w-[420px]">
+            <DialogHeader>
+              <DialogTitle>Set Stream Limit for Multiple Channels</DialogTitle>
+              <DialogDescription>
+                This overrides the stream limit for {selectedChannels.size} selected channel{selectedChannels.size !== 1 ? 's' : ''}, taking precedence over any group default or automation profile setting.
+              </DialogDescription>
+            </DialogHeader>
+
+            <div className="space-y-2 py-4">
+              <Label htmlFor="bulk-stream-limit">Stream Limit</Label>
+              <Input
+                id="bulk-stream-limit"
+                type="number"
+                min="0"
+                placeholder="e.g., 5"
+                value={bulkStreamLimitValue}
+                onChange={(e) => setBulkStreamLimitValue(e.target.value)}
+              />
+              <p className="text-xs text-muted-foreground">
+                Max streams kept assigned to each selected channel after checking. Use 0 for unlimited.
+              </p>
+            </div>
+
+            <DialogFooter>
+              <Button variant="outline" onClick={() => setBulkStreamLimitDialogOpen(false)}>
+                Cancel
+              </Button>
+              <Button
+                onClick={handleBulkSetStreamLimit}
+                disabled={savingBulkStreamLimit || bulkStreamLimitValue === ''}
+              >
+                {savingBulkStreamLimit && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+                Apply
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+
         <Dialog open={bulkDialogOpen} onOpenChange={setBulkDialogOpen}>
           <DialogContent className="sm:max-w-[600px]">
             <DialogHeader>

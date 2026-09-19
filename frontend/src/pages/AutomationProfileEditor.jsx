@@ -525,7 +525,7 @@ export default function AutomationProfileEditor() {
                                             </div>
 
                                             <div className="space-y-2">
-                                                <Label htmlFor="s_limit">Stream Limit per Channel</Label>
+                                                <Label htmlFor="s_limit">Default Stream Limit per Channel</Label>
                                                 <Input
                                                     id="s_limit"
                                                     type="number"
@@ -533,7 +533,9 @@ export default function AutomationProfileEditor() {
                                                     value={profile.stream_checking.stream_limit}
                                                     onChange={(e) => updateProfile('stream_checking.stream_limit', parseInt(e.target.value) || 0)}
                                                 />
-                                                <p className="text-[10px] text-muted-foreground">0 = Unlimited (Keep All Streams)</p>
+                                                <p className="text-[10px] text-muted-foreground">
+                                                    0 = Unlimited (Keep All Streams). This is only a fallback — set a Stream Limit on a channel or channel group in Channel Configuration to override it.
+                                                </p>
                                             </div>
 
                                             <div className="space-y-2">

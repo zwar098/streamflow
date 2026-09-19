@@ -486,6 +486,93 @@ class TestProgressTracking(unittest.TestCase):
         self.assertIn("write-back to Dispatcharr failed", joined)
         self.assertNotIn("checked and streams reordered", joined)
 
+    @patch('stream_checker_service.fetch_channel_streams')
+    @patch('stream_checker_service.get_udi_manager')
+    @patch('stream_checker_service.get_automation_config_manager')
+    @patch('stream_checker_service._get_base_url')
+    def test_stream_limit_probes_matching_unassigned_candidates(
+        self, mock_base_url, mock_get_automation_config, mock_get_udi, mock_fetch_streams
+    ):
+        """When a stream limit is set, a scheduled check must also probe
+        streams that match the channel but were never assigned (e.g. because
+        the limit was already full when discovery ran). Otherwise a better
+        stream can only ever be promoted by waiting for the next discovery
+        pass to add it — the exact "known matching streams" gap the user
+        asked to have closed."""
+        mock_base_url.return_value = "http://test:8000"
+
+        profile = {
+            'stream_matching': {'enabled': True, 'match_priority_order': ['regex']},
+            'stream_checking': {'enabled': True, 'stream_limit': 2},
+        }
+        mock_automation_config = MagicMock()
+        mock_automation_config.get_effective_configuration.return_value = {'profile': profile}
+        mock_get_automation_config.return_value = mock_automation_config
+
+        mock_udi = MagicMock()
+        mock_udi.get_channel_by_id.return_value = {'id': 1, 'name': 'Test Channel', 'tvg_id': None}
+        mock_udi.get_m3u_accounts.return_value = []
+        mock_get_udi.return_value = mock_udi
+
+        # Channel is already at its stream_limit capacity with two low-bitrate streams.
+        assigned_streams = [
+            {'id': 1, 'name': 'Stream 1', 'url': 'http://test1', 'bitrate_kbps': 1000},
+            {'id': 2, 'name': 'Stream 2', 'url': 'http://test2', 'bitrate_kbps': 1500},
+        ]
+        mock_fetch_streams.return_value = assigned_streams
+
+        # A much better stream matches the channel but was never assigned —
+        # discovery kept it out because the channel was already at capacity.
+        candidate_stream = {'id': 3, 'name': 'Stream 3', 'url': 'http://test3', 'bitrate_kbps': 9000}
+        mock_manager_instance = MagicMock()
+        mock_manager_instance.get_candidate_streams_for_channel.return_value = [candidate_stream]
+
+        with patch('stream_checker_service.CONFIG_DIR', Path(self.temp_dir)):
+            service = StreamCheckerService()
+            service._require_quality_check_connectivity = Mock(return_value=None)
+
+            def fake_analyze_stream(stream, *args, **kwargs):
+                return {
+                    'stream_id': stream.get('id'),
+                    'stream_name': stream.get('name'),
+                    'stream_url': stream.get('url'),
+                    'resolution': '1920x1080',
+                    'fps': 30,
+                    'video_codec': 'h264',
+                    'audio_codec': 'aac',
+                    'bitrate_kbps': stream.get('bitrate_kbps'),
+                    'status': 'OK',
+                }
+
+            class FakeSmartScheduler:
+                def check_streams_with_limits(self, streams, check_function, **kwargs):
+                    return [check_function(stream) for stream in streams]
+
+            fake_scheduler = FakeSmartScheduler()
+
+            with patch('stream_checker_service.analyze_stream', side_effect=fake_analyze_stream), \
+                 patch(
+                     'apps.stream.concurrent_stream_limiter.get_smart_scheduler',
+                     return_value=fake_scheduler,
+                 ), \
+                 patch(
+                     'apps.automation.automated_stream_manager.AutomatedStreamManager',
+                     return_value=mock_manager_instance,
+                 ):
+                with patch('stream_checker_service.batch_update_stream_stats', return_value=(3, 0)), \
+                     patch('stream_checker_service.update_channel_streams', return_value=True) as mock_update_order:
+                    service._check_channel(1)
+
+        mock_manager_instance.get_candidate_streams_for_channel.assert_called_once()
+        mock_update_order.assert_called_once()
+        written_stream_ids = mock_update_order.call_args[0][1]
+        self.assertEqual(len(written_stream_ids), 2)
+        # The high-bitrate candidate should have displaced the worst of the
+        # two previously-assigned streams, even though it was never assigned
+        # in Dispatcharr before this check.
+        self.assertIn(3, written_stream_ids)
+        self.assertNotIn(1, written_stream_ids)
+
 
 class TestLegacySequentialDelegation(unittest.TestCase):
     def test_legacy_sequential_entry_uses_exact_profile_scheduler(self):

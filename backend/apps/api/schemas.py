@@ -224,6 +224,51 @@ class BulkRegexPatternsSchema:
         return cls(channel_ids=channel_ids, regex_patterns=regex_patterns, m3u_accounts=m3u_accounts)
 
 
+def _parse_stream_limit(value: Any) -> int:
+    if isinstance(value, bool):
+        raise ValidationError("stream_limit must be a non-negative integer")
+    try:
+        limit = int(value)
+    except (TypeError, ValueError):
+        raise ValidationError("stream_limit must be a non-negative integer") from None
+    if limit < 0:
+        raise ValidationError("stream_limit must be a non-negative integer")
+    return limit
+
+
+@dataclass(frozen=True)
+class StreamLimitSchema:
+    stream_limit: int
+
+    @classmethod
+    def from_payload(cls, payload: Any) -> "StreamLimitSchema":
+        data = _ensure_dict(payload, message="No data provided")
+        if "stream_limit" not in data:
+            raise ValidationError("stream_limit is required")
+        return cls(stream_limit=_parse_stream_limit(data["stream_limit"]))
+
+
+@dataclass(frozen=True)
+class BulkStreamLimitSchema:
+    channel_ids: List[int]
+    stream_limit: int
+
+    @classmethod
+    def from_payload(cls, payload: Any) -> "BulkStreamLimitSchema":
+        data = _ensure_dict(payload, message="No data provided")
+
+        channel_ids_raw = _ensure_non_empty_list(data.get("channel_ids"), field_name="channel_ids")
+        try:
+            channel_ids = [int(cid) for cid in channel_ids_raw]
+        except (TypeError, ValueError):
+            raise ValidationError("channel_ids must be a list of integers") from None
+
+        if "stream_limit" not in data:
+            raise ValidationError("stream_limit is required")
+
+        return cls(channel_ids=channel_ids, stream_limit=_parse_stream_limit(data["stream_limit"]))
+
+
 @dataclass(frozen=True)
 class AutomationProfileCreateSchema:
     profile_data: Dict[str, Any]

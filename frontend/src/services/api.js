@@ -179,6 +179,16 @@ export const regexAPI = {
   updateBulkMatchSettings: (data) => api.post('/regex-patterns/bulk-settings', data),
 };
 
+export const streamLimitAPI = {
+  getChannelStreamLimit: (channelId) => api.get(`/channels/${channelId}/stream-limit`),
+  setChannelStreamLimit: (channelId, streamLimit) => api.post(`/channels/${channelId}/stream-limit`, { stream_limit: streamLimit }),
+  deleteChannelStreamLimit: (channelId) => api.delete(`/channels/${channelId}/stream-limit`),
+  getGroupStreamLimit: (groupId) => api.get(`/channels/groups/${groupId}/stream-limit`),
+  setGroupStreamLimit: (groupId, streamLimit) => api.post(`/channels/groups/${groupId}/stream-limit`, { stream_limit: streamLimit }),
+  deleteGroupStreamLimit: (groupId) => api.delete(`/channels/groups/${groupId}/stream-limit`),
+  bulkSetChannelStreamLimits: (channelIds, streamLimit) => api.post('/channels/stream-limit/bulk', { channel_ids: channelIds, stream_limit: streamLimit }),
+};
+
 export const streamAPI = {
   discoverStreams: () => api.post('/discover-streams'),
   refreshPlaylist: (accountId) => api.post('/refresh-playlist', accountId ? { account_id: accountId } : {}),

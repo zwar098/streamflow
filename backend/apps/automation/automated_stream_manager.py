@@ -775,7 +775,98 @@ class RegexChannelMatcher:
             "name": cfg.get("name", ""),
             "regex_patterns": cfg.get("regex_patterns", [])
         }
-    
+
+    def find_matching_streams_for_channel(
+        self,
+        channel_id: Union[str, int],
+        group_id: Optional[Union[str, int]],
+        streams: List[Dict[str, Any]],
+        exclude_stream_ids: Optional[set] = None,
+        channel_name: str = "",
+        priority_order: Optional[List[str]] = None,
+        channel_tvg_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Return the subset of `streams` matching this one channel's config.
+
+        Scoped to a single channel (unlike ``match_stream_to_channels``, which
+        fans a stream out across every configured channel). Used to build a
+        check-time candidate pool of streams that match but were never
+        assigned — e.g. because the channel's stream limit is already full —
+        so the checker can still give them a fair shot without waiting on a
+        discovery pass.
+        """
+        exclude_stream_ids = exclude_stream_ids or set()
+        config = self._get_effective_channel_config(channel_id, group_id)
+        if not config or not config.get("enabled", True):
+            return []
+
+        priority_order = priority_order or ['tvg', 'regex']
+        match_by_tvg = config.get("match_by_tvg_id", False)
+        case_sensitive = self.channel_patterns.get("global_settings", {}).get("case_sensitive", True)
+        channel_name = channel_name or config.get("name", "")
+
+        regex_patterns = config.get("regex_patterns")
+        if regex_patterns is None:
+            old_regex = config.get("regex", [])
+            old_m3u_accounts = config.get("m3u_accounts")
+            regex_patterns = [{"pattern": p, "m3u_accounts": old_m3u_accounts} for p in old_regex]
+
+        matches: List[Dict[str, Any]] = []
+        for stream in streams:
+            if not isinstance(stream, dict):
+                continue
+            stream_id = stream.get('id')
+            if stream_id is None or stream_id in exclude_stream_ids:
+                continue
+            stream_name = stream.get('name', '')
+            if not stream_name:
+                continue
+            stream_tvg_id = stream.get('tvg_id')
+            stream_m3u_account = stream.get('m3u_account')
+
+            matched = False
+            for match_type in priority_order:
+                if matched:
+                    break
+
+                if match_type == 'tvg':
+                    if match_by_tvg and stream_tvg_id and channel_tvg_id and stream_tvg_id == channel_tvg_id:
+                        matched = True
+
+                elif match_type == 'regex':
+                    if not config.get("enabled", True):
+                        continue
+                    for pattern_obj in regex_patterns:
+                        if isinstance(pattern_obj, dict):
+                            pattern = pattern_obj.get("pattern", "")
+                            pattern_m3u_accounts = pattern_obj.get("m3u_accounts")
+                        else:
+                            pattern = pattern_obj
+                            pattern_m3u_accounts = None
+
+                        if not pattern:
+                            continue
+                        if pattern_m3u_accounts is not None and len(pattern_m3u_accounts) > 0:
+                            if stream_m3u_account is None or stream_m3u_account not in pattern_m3u_accounts:
+                                continue
+                        if match_by_tvg:
+                            is_catch_all = pattern in (".*", "^.*$", ".+", "^.+$")
+                            if is_catch_all:
+                                continue
+
+                        try:
+                            compiled_pattern = _compile_stream_search_regex(pattern, channel_name, case_sensitive)
+                            if compiled_pattern.search(stream_name):
+                                matched = True
+                                break
+                        except re.error as e:
+                            logger.error(f"Invalid regex pattern '{pattern}' for channel {channel_id}: {e}")
+
+            if matched:
+                matches.append(stream)
+
+        return matches
+
     def validate_regex_patterns(self, patterns: List[str]) -> Tuple[bool, Optional[str]]:
         """Validate a list of regex patterns.
         
@@ -4157,6 +4248,53 @@ class AutomatedStreamManager:
         finally:
             self._lock.release()
 
+    def get_candidate_streams_for_channel(
+        self,
+        channel_id: Union[str, int],
+        group_id: Optional[Union[str, int]] = None,
+        exclude_stream_ids: Optional[set] = None,
+        channel_name: str = "",
+        priority_order: Optional[List[str]] = None,
+        channel_tvg_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Return streams that match this channel but aren't already assigned.
+
+        Used by the stream checker to build a check-time candidate pool
+        (currently-assigned + matching-but-unassigned) when a stream limit is
+        set, so streams the limit kept out of Dispatcharr still get probed and
+        can win a slot on merit instead of only ever being added on the next
+        discovery pass.
+        """
+        all_streams = get_streams(log_result=False)
+        if not isinstance(all_streams, list) or not all_streams:
+            return []
+
+        all_accounts = self._m3u_accounts_cache if self._m3u_accounts_cache is not None else get_m3u_accounts()
+        if all_accounts:
+            enabled_accounts_config = self.config.get("enabled_m3u_accounts", [])
+            active_accounts = [acc for acc in all_accounts if acc.get('is_active', True)]
+            if enabled_accounts_config:
+                enabled_account_ids = {
+                    acc.get('id') for acc in active_accounts
+                    if acc.get('id') in enabled_accounts_config and acc.get('id') is not None
+                }
+            else:
+                enabled_account_ids = {acc.get('id') for acc in active_accounts if acc.get('id') is not None}
+            all_streams = [
+                s for s in all_streams
+                if s.get('is_custom', False) or s.get('m3u_account') in enabled_account_ids
+            ]
+
+        return self.regex_matcher.find_matching_streams_for_channel(
+            channel_id,
+            group_id,
+            all_streams,
+            exclude_stream_ids=exclude_stream_ids,
+            channel_name=channel_name,
+            priority_order=priority_order,
+            channel_tvg_id=channel_tvg_id,
+        )
+
     def _mark_checking_only_channels(self, checking_only_channel_ids: List[int], udi, skip_check_trigger: bool) -> None:
         """Mark matching-disabled/checking-enabled channels for quality checks."""
         if not checking_only_channel_ids:
@@ -4330,6 +4468,7 @@ class AutomatedStreamManager:
             automation_config = get_automation_config_manager()
             matching_enabled_channel_ids = []
             channel_to_revive_enabled = {}
+            channel_to_profile_stream_limit = {}
             channel_tvg_map = {}
             channel_to_match_priorities = {}
             channel_to_group_map = {}
@@ -4419,6 +4558,11 @@ class AutomatedStreamManager:
                 # Check if revive is enabled
                 if profile and profile.get('stream_checking', {}).get('allow_revive', False):
                     channel_to_revive_enabled[str(channel_id)] = True
+
+                # Record the profile's stream_limit as the fallback for the
+                # channel/group stream-limit override resolution below.
+                if profile:
+                    channel_to_profile_stream_limit[str(channel_id)] = profile.get('stream_checking', {}).get('stream_limit', 0)
 
             # Collect channels excluded from matching but eligible for quality checking.
             #
@@ -4763,6 +4907,31 @@ class AutomatedStreamManager:
                         # via filter_dead_streams, making allow_revive permanently ineffective.
                         _ch_revive_enabled = channel_to_revive_enabled.get(channel_id, False)
                         _ch_allow_dead = (not dead_stream_removal_enabled) or _ch_revive_enabled
+
+                        # Cap new matches so an M3U refresh can never push a channel
+                        # past its resolved stream limit. Only the checker (on its own
+                        # schedule) decides which streams actually make the cut — this
+                        # just stops the channel from ballooning back up in the meantime.
+                        from apps.automation.stream_limit_config import get_stream_limit_config
+                        effective_limit = get_stream_limit_config().get_effective_stream_limit(
+                            channel_id_int,
+                            channel_to_group_map.get(channel_id),
+                            channel_to_profile_stream_limit.get(channel_id, 0),
+                        )
+                        if effective_limit > 0:
+                            existing_count = len(channel_streams.get(channel_id, set()))
+                            remaining_capacity = max(0, effective_limit - existing_count)
+                            if len(stream_ids) > remaining_capacity:
+                                logger.info(
+                                    f"Stream limit {effective_limit} for channel {channel_id}: "
+                                    f"channel already has {existing_count} assigned, only accepting "
+                                    f"{remaining_capacity} of {len(stream_ids)} newly matched streams"
+                                )
+                                stream_ids = stream_ids[:remaining_capacity]
+                                assignment_details[channel_id] = assignment_details[channel_id][:remaining_capacity]
+                                if not stream_ids:
+                                    continue
+
                         try:
                             added_count = assign_streams_to_channel(channel_id_int, stream_ids, allow_dead_streams=_ch_allow_dead)
                         except TypeError as assign_error:

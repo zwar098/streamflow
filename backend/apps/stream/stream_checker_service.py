@@ -3776,6 +3776,8 @@ class StreamCheckerService:
 
         # Get effective profile for this channel
         stream_limit = 0
+        profile_stream_limit = 0
+        group_id = None
         allow_revive = True
         grace_period = False
         loop_check_enabled = False
@@ -3817,7 +3819,7 @@ class StreamCheckerService:
                 profile = config.get('profile') if config else None
             if profile:
                 profile_stream_checking = profile.get('stream_checking', {})
-                stream_limit = profile_stream_checking.get('stream_limit', 0)
+                profile_stream_limit = profile_stream_checking.get('stream_limit', 0)
                 allow_revive = profile_stream_checking.get('allow_revive', True)
                 priority_m3u_ids = profile_stream_checking.get('m3u_priority', [])
                 priority_mode = profile_stream_checking.get('m3u_priority_mode', 'absolute')
@@ -3862,6 +3864,14 @@ class StreamCheckerService:
         except Exception as e:
             logger.warning(f"Failed to load profile settings for channel {channel_id}: {e}")
             _threshold_config = {}
+
+        # Channel/group stream-limit overrides take precedence over the profile's
+        # own stream_checking.stream_limit, which is kept only as a fallback.
+        from apps.automation.stream_limit_config import get_stream_limit_config
+        stream_limit = get_stream_limit_config().get_effective_stream_limit(
+            channel_id, group_id, profile_stream_limit
+        )
+
         profile_progress_context = self._automation_profile_progress_context(
             profile,
             forced_profile_id=forced_profile_id,
@@ -3928,6 +3938,41 @@ class StreamCheckerService:
             )
             if abort_result:
                 return abort_result
+
+            # When a stream limit is set, also probe streams that match this channel
+            # but weren't assigned (e.g. the limit already filled up before a better
+            # stream showed up). This lets new/better streams win a slot on merit at
+            # check time instead of only ever being added by the next discovery pass.
+            if stream_limit > 0:
+                try:
+                    already_assigned_ids = {
+                        s.get('id') for s in (streams or []) if isinstance(s, dict) and s.get('id') is not None
+                    }
+                    from apps.automation.automated_stream_manager import AutomatedStreamManager
+                    automation_manager = AutomatedStreamManager()
+                    priority_order = (
+                        profile.get('stream_matching', {}).get('match_priority_order', ['tvg', 'regex'])
+                        if profile else ['tvg', 'regex']
+                    )
+                    candidate_streams = automation_manager.get_candidate_streams_for_channel(
+                        channel_id,
+                        group_id,
+                        exclude_stream_ids=already_assigned_ids,
+                        channel_name=channel_name,
+                        priority_order=priority_order,
+                        channel_tvg_id=channel_data.get('tvg_id'),
+                    )
+                    if candidate_streams:
+                        logger.info(
+                            f"Stream limit {stream_limit} for channel {channel_name}: "
+                            f"probing {len(candidate_streams)} matching-but-unassigned "
+                            f"stream(s) alongside {len(streams or [])} currently assigned"
+                        )
+                        streams = (streams or []) + candidate_streams
+                except Exception as candidate_error:
+                    logger.warning(
+                        f"Could not build stream-limit candidate pool for channel {channel_id}: {candidate_error}"
+                    )
 
             if not streams or len(streams) == 0:
                 logger.info(f"No streams found for channel {channel_name}")
