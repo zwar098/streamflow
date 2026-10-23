@@ -47,6 +47,11 @@ def _public_single_stream_check_result(value: Any) -> Any:
                     'replace_pattern',
                     'username',
                     'password',
+                    'error',
+                    'errors',
+                    'exception',
+                    'traceback',
+                    'stderr',
                 }
             ):
                 continue
@@ -1014,7 +1019,20 @@ def check_single_channel_now_response(
         if error_code is None and (
             result.get("success") is True or result.get("skipped") is True
         ):
-            return jsonify(result), 200
+            # Do not serialize the internal result envelope (which may contain
+            # exception diagnostics). Preserve the documented success/skip
+            # fields and scrub private diagnostics in nested measurements.
+            public_result = {
+                key: _public_single_stream_check_result(result[key])
+                for key in (
+                    'success', 'skipped', 'reason', 'message', 'channel_id',
+                    'channel_name', 'details', 'automation_profile_id',
+                    'automation_profile_name', 'automation_profile_source',
+                    'run_mode', 'run_snapshot', 'channels_hidden',
+                    'channels_ready', 'channel_visibility_changed', 'stats',
+                ) if key in result
+            }
+            return jsonify(public_result), 200
 
         logger.warning(
             "Single-channel check failed; returning sanitized error response for channel %s",

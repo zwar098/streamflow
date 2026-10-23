@@ -1,10 +1,11 @@
 requests
+certifi>=2026.10.19
 python-dotenv
 pandas
 flask
 flask-cors
 croniter
-Pillow
+Pillow>=13.0.0
 imagehash
 imutils
 opencv-python-headless

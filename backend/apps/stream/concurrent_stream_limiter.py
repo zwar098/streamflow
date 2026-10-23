@@ -23,6 +23,7 @@ import inspect
 import re
 import threading
 import time
+from apps.core.operation_timing import STREAM_OPERATION_TIMINGS
 import uuid
 from collections import defaultdict
 from contextlib import ExitStack, nullcontext
@@ -977,7 +978,7 @@ class AccountStreamLimiter:
                 return AcquireResult(False, 'provider_profile_unavailable')
         
         # Poll for available slot with exponential backoff
-        start_time = time.time()
+        start_time = time.monotonic()
         wait_time = 0.1  # Start with 100ms
         max_wait = 2.0  # Max 2 seconds between checks
         
@@ -1026,7 +1027,7 @@ class AccountStreamLimiter:
             
             # No slot available, check timeout
             if timeout is not None:
-                elapsed = time.time() - start_time
+                elapsed = time.monotonic() - start_time
                 if elapsed >= timeout:
                     log_method = logger.debug if timeout <= 0 else logger.warning
                     log_method(
@@ -2531,6 +2532,7 @@ class SmartStreamScheduler:
         abort_event: Optional[threading.Event] = None,
         provider_wait_timeout: Optional[float] = 300.0,
         capacity_transition_lock: Optional[Any] = None,
+        probe_slots: Optional[Any] = None,
         **check_params
     ) -> List[Dict[str, Any]]:
         """
@@ -2555,6 +2557,8 @@ class SmartStreamScheduler:
                 publication. Reservation/start and release/terminal transitions run
                 under this boundary so a heartbeat cannot mix stream rows and profile
                 slots from different capacity generations.
+            probe_slots: Optional shared semaphore for parallel channel runs.
+                All phases in those runs consume the same global probe budget.
             **check_params: Additional parameters for check_function
             
         Returns:
@@ -2611,7 +2615,7 @@ class SmartStreamScheduler:
             max(self.global_limit * 2, self.global_limit + len(account_groups), 16),
             64,
         )
-        global_probe_slots = threading.Semaphore(max(1, self.global_limit))
+        global_probe_slots = probe_slots if probe_slots is not None else threading.Semaphore(max(1, self.global_limit))
         logger.info(
             "Using %s coordination workers for %s streams with %s global probe slots",
             worker_count,
@@ -2681,7 +2685,8 @@ class SmartStreamScheduler:
                     acquired_profile = None
                     acquired_stream_url = None
                     acquired_global = False
-                    wait_started = time.time()
+                    wait_started = time.monotonic()
+                    wait_recorded = False
                     wait_reason = None
                     retrying_after_preempt = False
                     preemption_token = object()
@@ -2897,7 +2902,7 @@ class SmartStreamScheduler:
                                 provider_wait_timeout is not None
                                 and not self._is_internal_capacity_wait(wait_reason)
                             ):
-                                elapsed = time.time() - wait_started
+                                elapsed = time.monotonic() - wait_started
                                 if elapsed >= provider_wait_timeout:
                                     logger.warning(
                                         f"Provider capacity wait timed out for stream {stream['id']} "
@@ -2946,12 +2951,17 @@ class SmartStreamScheduler:
                         if acquired_profile or account_id is not None:
                             runtime_params['preempt_check'] = preempt_check
 
-                        result = check_function(
-                            stream_url=stream_url,
-                            stream_id=stream['id'],
-                            stream_name=stream.get('name', 'Unknown'),
-                            **runtime_params
+                        STREAM_OPERATION_TIMINGS.record(
+                            'provider_wait', time.monotonic() - wait_started,
                         )
+                        wait_recorded = True
+                        with STREAM_OPERATION_TIMINGS.measure('analysis'):
+                            result = check_function(
+                                stream_url=stream_url,
+                                stream_id=stream['id'],
+                                stream_name=stream.get('name', 'Unknown'),
+                                **runtime_params
+                            )
                         if isinstance(result, dict):
                             # Credential-rewritten URLs are probe-only. Persisted,
                             # returned, and callback-visible results must retain
@@ -2978,6 +2988,8 @@ class SmartStreamScheduler:
                             return wrapped_check(preempted_for_viewer=True)
                         return result
                     finally:
+                        if not wait_recorded:
+                            STREAM_OPERATION_TIMINGS.record('provider_wait', time.monotonic() - wait_started)
                         finalize_completion()
 
                 # Submit to executor

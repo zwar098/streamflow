@@ -13,6 +13,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Any, Set
 import requests
+from apps.core import http_transport
+from apps.core.retry_after import retry_after_seconds
 
 from apps.core.logging_config import setup_logging, log_api_request, log_api_response
 from apps.config.dispatcharr_config import get_dispatcharr_config
@@ -234,6 +236,23 @@ class UDIFetcher:
 
         return result
 
+    def fetch_channel_ids(self) -> Optional[Set[int]]:
+        """Fetch the channel visibility oracle without fetching stream IDs."""
+        if not self.base_url:
+            logger.warning("fetch_channel_ids: base_url not set")
+            return None
+
+        url = f"{self.base_url}/api/channels/channels/ids/?visibility_filter=all"
+        data = self._fetch_url(url)
+        if not isinstance(data, list):
+            logger.warning("fetch_channel_ids: failed to fetch channel IDs")
+            return None
+        try:
+            return {int(channel_id) for channel_id in data}
+        except (TypeError, ValueError) as exc:
+            logger.warning("fetch_channel_ids: non-integer channel ID: %s", exc)
+            return None
+
     def fetch_entity_counts(self) -> Dict[str, Optional[int]]:
         """Return entity counts derived from fetch_all_ids() (integrity oracle for refresh_all).
 
@@ -329,10 +348,10 @@ class UDIFetcher:
         """
         for attempt in range(1, GET_RETRY_ATTEMPTS + 1):
             try:
-                start_time = time.time()
+                start_time = time.monotonic()
                 log_api_request(logger, "GET", url)
-                resp = requests.get(url, headers=_get_auth_headers(), timeout=GET_TIMEOUT_SECONDS)
-                elapsed = time.time() - start_time
+                resp = http_transport.get(url, headers=_get_auth_headers(), timeout=GET_TIMEOUT_SECONDS)
+                elapsed = time.monotonic() - start_time
                 log_api_response(logger, "GET", url, resp.status_code, elapsed)
                 self._record_request_timing(
                     method="GET",
@@ -342,16 +361,12 @@ class UDIFetcher:
                     success=resp.status_code < 400,
                 )
 
-                resp.raise_for_status()
-                return resp.json()
-            except requests.exceptions.HTTPError as e:
-                status_code = e.response.status_code if e.response is not None else None
-                if status_code == 401:
+                if resp.status_code == 401:
                     if _refresh_token():
                         logger.info("Retrying request with new token...")
-                        retry_start = time.time()
-                        resp = requests.get(url, headers=_get_auth_headers(), timeout=GET_TIMEOUT_SECONDS)
-                        retry_elapsed = time.time() - retry_start
+                        retry_start = time.monotonic()
+                        resp = http_transport.get(url, headers=_get_auth_headers(), timeout=GET_TIMEOUT_SECONDS)
+                        retry_elapsed = time.monotonic() - retry_start
                         self._record_request_timing(
                             method="GET",
                             url=url,
@@ -359,16 +374,20 @@ class UDIFetcher:
                             status_code=resp.status_code,
                             success=resp.status_code < 400,
                         )
-                        resp.raise_for_status()
-                        return resp.json()
-
+                resp.raise_for_status()
+                return resp.json()
+            except requests.exceptions.HTTPError as e:
+                status_code = e.response.status_code if e.response is not None else None
                 retryable = status_code in {429, 500, 502, 503, 504}
                 if retryable and attempt < GET_RETRY_ATTEMPTS:
+                    delay = retry_after_seconds(e.response) if status_code in {429, 503} else None
+                    if delay is None:
+                        delay = GET_RETRY_BACKOFF_SECONDS * attempt
                     logger.warning(
                         f"Transient HTTP {status_code} fetching {url}; retrying "
-                        f"({attempt}/{GET_RETRY_ATTEMPTS})"
+                        f"({attempt}/{GET_RETRY_ATTEMPTS}) after {delay:g} seconds"
                     )
-                    time.sleep(GET_RETRY_BACKOFF_SECONDS * attempt)
+                    time.sleep(delay)
                     continue
                 logger.error(f"Error fetching {url}: {e}")
                 return None
@@ -376,7 +395,7 @@ class UDIFetcher:
                 self._record_request_timing(
                     method="GET",
                     url=url,
-                    elapsed=time.time() - start_time if 'start_time' in locals() else 0,
+                    elapsed=time.monotonic() - start_time if 'start_time' in locals() else 0,
                     status_code=None,
                     success=False,
                 )
@@ -401,10 +420,10 @@ class UDIFetcher:
             Parsed JSON response, or None on failure.
         """
         try:
-            start_time = time.time()
+            start_time = time.monotonic()
             log_api_request(logger, "POST", url, json=json_body)
-            resp = requests.post(url, headers=_get_auth_headers(), json=json_body, timeout=30)
-            elapsed = time.time() - start_time
+            resp = http_transport.post(url, headers=_get_auth_headers(), json=json_body, timeout=30)
+            elapsed = time.monotonic() - start_time
             log_api_response(logger, "POST", url, resp.status_code, elapsed)
             self._record_request_timing(
                 method="POST",
@@ -420,9 +439,9 @@ class UDIFetcher:
             if e.response is not None and e.response.status_code == 401:
                 if _refresh_token():
                     logger.info("Retrying POST request with new token...")
-                    retry_start = time.time()
-                    resp = requests.post(url, headers=_get_auth_headers(), json=json_body, timeout=30)
-                    retry_elapsed = time.time() - retry_start
+                    retry_start = time.monotonic()
+                    resp = http_transport.post(url, headers=_get_auth_headers(), json=json_body, timeout=30)
+                    retry_elapsed = time.monotonic() - retry_start
                     self._record_request_timing(
                         method="POST",
                         url=url,
@@ -438,7 +457,7 @@ class UDIFetcher:
             self._record_request_timing(
                 method="POST",
                 url=url,
-                elapsed=time.time() - start_time if 'start_time' in locals() else 0,
+                elapsed=time.monotonic() - start_time if 'start_time' in locals() else 0,
                 status_code=None,
                 success=False,
             )

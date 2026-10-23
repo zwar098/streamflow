@@ -114,15 +114,18 @@ export const sortTeamarrManagedEvents = (events = []) => (
 
 export const filterTeamarrEventsByView = (events = [], view = 'upcoming', config = {}) => {
   if (view === 'all') return events
-  if (view === 'past') return events.filter(event => String(event?.state || '') === 'past')
+  if (view === 'filtered') return events.filter(event => String(event?.state || '') === 'filtered')
+
+  const visibleEvents = events.filter(event => String(event?.state || '') !== 'filtered')
+  if (view === 'past') return visibleEvents.filter(event => String(event?.state || '') === 'past')
   if (view === 'no_check') {
-    return events.filter(event => (
+    return visibleEvents.filter(event => (
       !event?.last_preflight_event
       && isStaticTeamDefaultUpcoming(event, config)
     ))
   }
-  if (view === 'due') return events.filter(event => String(event?.state || '') === 'due')
-  return events.filter(event => (
+  if (view === 'due') return visibleEvents.filter(event => String(event?.state || '') === 'due')
+  return visibleEvents.filter(event => (
     String(event?.state || '') !== 'past'
     && isStaticTeamDefaultUpcoming(event, config)
   ))

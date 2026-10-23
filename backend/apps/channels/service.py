@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, cast
 
 from apps.channels.repository import ChannelRepository
+from apps.channels.active_profile import enrich_active_profiles
 from apps.core.stream_stats_utils import (
     calculate_channel_averages,
     extract_stream_stats,
@@ -20,6 +21,7 @@ class ChannelQuery:
     sort_dir: str = "asc"
     page: Optional[int] = None
     per_page: int = 50
+    include_active_profile: bool = False
 
 
 class ChannelService:
@@ -52,14 +54,14 @@ class ChannelService:
             # No pagination: apply order, then enrich the full ordered list
             ordered = self._channel_order_manager.apply_order(sorted_channels)
             return {
-                "items": self._enrich_channels(ordered),
+                "items": self._enrich_channels(ordered, query.include_active_profile),
                 "paginated": False,
             }
 
         # Paginate first, then enrich only the page slice — avoids O(N) enrichment
         # for every channel when the caller only wants one page of results.
         result = self._paginate(sorted_channels, query.page, query.per_page)
-        result["items"] = self._enrich_channels(result["items"])
+        result["items"] = self._enrich_channels(result["items"], query.include_active_profile)
         return result
 
     def get_channel_stats(self, channel_id: int) -> Dict[str, Any]:
@@ -130,7 +132,7 @@ class ChannelService:
             reverse=reverse,
         )
 
-    def _enrich_channels(self, channels: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _enrich_channels(self, channels: List[Dict[str, Any]], include_active_profile: bool = False) -> List[Dict[str, Any]]:
         if not channels:
             return channels
 
@@ -206,7 +208,7 @@ class ChannelService:
 
             enriched.append(ch_copy)
 
-        return enriched
+        return enrich_active_profiles(enriched, self._automation_config) if include_active_profile else enriched
 
     def _paginate(self, items: List[Dict[str, Any]], page: int, per_page: int) -> Dict[str, Any]:
         total = len(items)

@@ -11,12 +11,14 @@ from apps.api.schemas import (
     ChannelMatchSettingsSchema,
     GroupRegexConfigSchema,
     RegexPatternCreateSchema,
+    RegexMassEditSchema,
 )
 from apps.automation.regex_settings import (
     default_channel_regex_global_settings,
     normalize_channel_regex_global_settings,
 )
 from apps.automation.intentional_user_regex import search_user_regex
+from apps.automation.regex_edit import prepare_replacements
 from apps.channels.repository import UdiChannelRepository
 from apps.core.api_responses import error_response
 from apps.core.exceptions import ValidationError
@@ -236,7 +238,7 @@ def upsert_group_regex_config_response(
         )
     except ValueError as exc:
         logger.warning(f"Validation error upserting group regex config for group {group_id}: {exc}")
-        return error_response(str(exc), status_code=400, code="validation_error")
+        return error_response("Invalid group regex configuration. Check the pattern syntax and settings.", status_code=400, code="validation_error")
     except Exception as exc:
         logger.error(f"Error upserting regex config for group {group_id}: {exc}")
         return error_response("Internal Server Error", status_code=500, code="internal_error")
@@ -369,7 +371,7 @@ def add_bulk_regex_patterns_response(
                 success_count += 1
             except Exception as exc:
                 logger.error(f"Error adding pattern to channel {channel_id}: {exc}")
-                failed_channels.append({"channel_id": channel_id, "error": str(exc)})
+                failed_channels.append({"channel_id": channel_id, "error": "Channel operation failed. Check the server log for details."})
 
         response_data = {
             "message": f"Successfully added patterns to {success_count} channel(s)",
@@ -421,7 +423,7 @@ def bulk_delete_regex_patterns_response(*, payload: Any, get_regex_matcher: Call
                 success_count += 1
             except Exception as exc:
                 logger.error(f"Error deleting patterns from channel {channel_id}: {exc}")
-                failed_channels.append({"channel_id": channel_id, "error": str(exc)})
+                failed_channels.append({"channel_id": channel_id, "error": "Channel operation failed. Check the server log for details."})
 
         response_data = {
             "message": f"Successfully deleted patterns from {success_count} channel(s)",
@@ -599,7 +601,7 @@ def bulk_edit_regex_pattern_response(
                     )
             except Exception as exc:
                 logger.error(f"Error editing pattern in channel {channel_id}: {exc}")
-                failed_channels.append({"channel_id": channel_id, "error": str(exc)})
+                failed_channels.append({"channel_id": channel_id, "error": "Channel operation failed. Check the server log for details."})
 
         response_data = {
             "message": f"Successfully edited pattern in {success_count} channel(s)",
@@ -647,7 +649,7 @@ def bulk_update_match_settings_response(*, payload: Any, get_regex_matcher: Call
                             {"channel_id": channel_id, "error": "Failed to set setting"}
                         )
             except Exception as exc:
-                failed_channels.append({"channel_id": channel_id, "error": str(exc)})
+                failed_channels.append({"channel_id": channel_id, "error": "Channel operation failed. Check the server log for details."})
 
         return jsonify(
             {
@@ -671,35 +673,26 @@ def mass_edit_preview_response(
 ):
     """Handle preview for regex mass find/replace."""
     try:
-        if not payload:
-            return jsonify({"error": "No data provided"}), 400
-
-        required_fields = ["channel_ids", "find_pattern", "replace_pattern"]
-        if not all(field in payload for field in required_fields):
-            return jsonify({"error": f"Missing required fields: {required_fields}"}), 400
-
-        channel_ids = payload["channel_ids"]
-        find_pattern = payload["find_pattern"]
-        replace_pattern = payload["replace_pattern"]
-        use_regex = payload.get("use_regex", False)
-
-        if not isinstance(channel_ids, list) or len(channel_ids) == 0:
-            return jsonify({"error": "channel_ids must be a non-empty list"}), 400
+        parsed = RegexMassEditSchema.from_payload(payload)
+        channel_ids = parsed.channel_ids
+        find_pattern = parsed.find_pattern
+        replace_pattern = parsed.replace_pattern
+        use_regex = parsed.use_regex
 
         matcher = get_regex_matcher()
         udi = get_udi_manager()
 
-        if use_regex:
-            try:
-                if is_dangerous_regex(find_pattern):
-                    return jsonify(
-                        {
-                            "error": "Regex pattern contains dangerous nested quantifiers (ReDoS risk)"
-                        }
-                    ), 400
-                find_regex = re.compile(find_pattern)
-            except re.error:
-                return jsonify({"error": "Invalid regex pattern"}), 400
+        if use_regex and is_dangerous_regex(find_pattern):
+            return jsonify({"error": "Regex pattern contains dangerous nested quantifiers (ReDoS risk)"}), 400
+
+        # Snapshot once and finish the bounded replacement batch before writes.
+        patterns_snapshot = matcher.get_patterns()
+        selected_patterns = []
+        for channel_id in channel_ids:
+            config = patterns_snapshot.get("patterns", {}).get(str(channel_id), {})
+            selected_patterns.extend(item.get("pattern", "") if isinstance(item, dict) else item
+                                     for item in config.get("regex_patterns", []))
+        replacements = prepare_replacements(find_pattern, replace_pattern, selected_patterns, use_regex=use_regex)
 
         affected_channels = []
         total_patterns_affected = 0
@@ -711,7 +704,7 @@ def mass_edit_preview_response(
                     continue
 
                 channel_name = channel.get("name", f"Channel {channel_id}")
-                patterns = matcher.get_patterns()
+                patterns = patterns_snapshot
                 existing_patterns = patterns.get("patterns", {}).get(str(channel_id), {})
                 regex_patterns = existing_patterns.get("regex_patterns", [])
 
@@ -729,13 +722,7 @@ def mass_edit_preview_response(
                         pattern_m3u_accounts = None
                         pattern_priority = 0
 
-                    try:
-                        if use_regex:
-                            new_pattern = find_regex.sub(replace_pattern, pattern)
-                        else:
-                            new_pattern = pattern.replace(find_pattern, replace_pattern)
-                    except re.error:
-                        return jsonify({"error": "Invalid replacement pattern"}), 400
+                    new_pattern = replacements[pattern]
 
                     if new_pattern != pattern:
                         affected_patterns.append(
@@ -770,6 +757,8 @@ def mass_edit_preview_response(
                 "use_regex": use_regex,
             }
         )
+    except ValidationError as exc:
+        return error_response(exc.message, status_code=exc.status_code, code=exc.error_code)
     except Exception as exc:
         logger.error(f"Error previewing mass edit: {exc}")
         return jsonify({"error": "Internal Server Error"}), 500
@@ -784,36 +773,27 @@ def mass_edit_regex_patterns_response(
 ):
     """Handle regex mass find/replace execution across channels."""
     try:
-        if not payload:
-            return jsonify({"error": "No data provided"}), 400
-
-        required_fields = ["channel_ids", "find_pattern", "replace_pattern"]
-        if not all(field in payload for field in required_fields):
-            return jsonify({"error": f"Missing required fields: {required_fields}"}), 400
-
-        channel_ids = payload["channel_ids"]
-        find_pattern = payload["find_pattern"]
-        replace_pattern = payload["replace_pattern"]
-        use_regex = payload.get("use_regex", False)
+        parsed = RegexMassEditSchema.from_payload(payload)
+        channel_ids = parsed.channel_ids
+        find_pattern = parsed.find_pattern
+        replace_pattern = parsed.replace_pattern
+        use_regex = parsed.use_regex
         new_m3u_accounts = payload.get("new_m3u_accounts")
-
-        if not isinstance(channel_ids, list) or len(channel_ids) == 0:
-            return jsonify({"error": "channel_ids must be a non-empty list"}), 400
 
         matcher = get_regex_matcher()
         udi = get_udi_manager()
 
-        if use_regex:
-            try:
-                if is_dangerous_regex(find_pattern):
-                    return jsonify(
-                        {
-                            "error": "Regex pattern contains dangerous nested quantifiers (ReDoS risk)"
-                        }
-                    ), 400
-                find_regex = re.compile(find_pattern)
-            except re.error:
-                return jsonify({"error": "Invalid regex pattern"}), 400
+        if use_regex and is_dangerous_regex(find_pattern):
+            return jsonify({"error": "Regex pattern contains dangerous nested quantifiers (ReDoS risk)"}), 400
+
+        # Snapshot once and finish the bounded replacement batch before writes.
+        patterns_snapshot = matcher.get_patterns()
+        selected_patterns = []
+        for channel_id in channel_ids:
+            config = patterns_snapshot.get("patterns", {}).get(str(channel_id), {})
+            selected_patterns.extend(item.get("pattern", "") if isinstance(item, dict) else item
+                                     for item in config.get("regex_patterns", []))
+        replacements = prepare_replacements(find_pattern, replace_pattern, selected_patterns, use_regex=use_regex)
 
         success_count = 0
         failed_channels = []
@@ -827,7 +807,7 @@ def mass_edit_regex_patterns_response(
                     continue
 
                 channel_name = channel.get("name", f"Channel {channel_id}")
-                patterns = matcher.get_patterns()
+                patterns = patterns_snapshot
                 existing_patterns = patterns.get("patterns", {}).get(str(channel_id), {})
                 regex_patterns = existing_patterns.get("regex_patterns", [])
 
@@ -849,30 +829,18 @@ def mass_edit_regex_patterns_response(
                         pattern_m3u_accounts = None
                         pattern_priority = 0
 
-                    try:
-                        if use_regex:
-                            new_pattern = find_regex.sub(replace_pattern, pattern)
-                        else:
-                            new_pattern = pattern.replace(find_pattern, replace_pattern)
-                    except re.error as exc:
-                        failed_channels.append(
-                            {
-                                "channel_id": channel_id,
-                                "error": f"Invalid replacement pattern: {str(exc)}",
-                            }
-                        )
-                        channel_failed = True
-                        break
+                    new_pattern = replacements[pattern]
 
                     if new_pattern != pattern:
                         patterns_changed = True
 
                     is_valid, error_msg = matcher.validate_regex_patterns([new_pattern])
                     if not is_valid:
+                        logger.warning("Invalid mass-edit result for channel %s: %s", channel_id, error_msg)
                         failed_channels.append(
                             {
                                 "channel_id": channel_id,
-                                "error": f"Invalid resulting pattern '{new_pattern}': {error_msg}",
+                                "error": "Invalid resulting regex pattern. Review the preview before applying changes.",
                             }
                         )
                         channel_failed = True
@@ -903,7 +871,7 @@ def mass_edit_regex_patterns_response(
                     total_patterns_updated += len(updated_patterns)
             except Exception as exc:
                 logger.error(f"Error applying mass edit to channel {channel_id}: {exc}")
-                failed_channels.append({"channel_id": channel_id, "error": str(exc)})
+                failed_channels.append({"channel_id": channel_id, "error": "Channel operation failed. Check the server log for details."})
 
         logger.info(
             f"Mass edit completed: {success_count} channels updated, {total_patterns_updated} patterns affected"
@@ -920,6 +888,8 @@ def mass_edit_regex_patterns_response(
             response_data["failed_count"] = len(failed_channels)
 
         return jsonify(response_data)
+    except ValidationError as exc:
+        return error_response(exc.message, status_code=exc.status_code, code=exc.error_code)
     except Exception as exc:
         logger.error(f"Error in mass edit: {exc}")
         return jsonify({"error": "Internal Server Error"}), 500

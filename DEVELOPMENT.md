@@ -3,7 +3,7 @@
 ## Stack
 
 - **Backend:** Python 3, Flask, ffmpeg (subprocess)
-- **Frontend:** React 18, Vite, ShadCN UI (Radix + Tailwind CSS), React Router v6, Axios, Recharts
+- **Frontend:** React 19, Vite, ShadCN UI (Radix + Tailwind CSS), React Router v7, Axios, Recharts
 - **Container:** Single Docker image, Flask serves both API and built React static files
 
 ## Quick start (dev)

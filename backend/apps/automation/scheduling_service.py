@@ -44,6 +44,15 @@ AUTO_CREATE_MAX_EVENTS_PER_POLL_BOUNDS = (1, 1000)
 
 
 # ── SCH-002 ────────────────────────────────────────────────────────────────
+def missing_tvg_id_message(channel_id: int) -> str:
+    """Public configuration guidance, independent of any exception message."""
+    return (
+        f"Channel {channel_id} has no TVG-ID configured. "
+        "Set the TVG-ID in Dispatcharr (open channel \u2192 Use EPG TVG-ID) "
+        "to enable EPG program matching."
+    )
+
+
 class NoTvgIdError(Exception):
     """Raised when a channel has no TVG-ID and EPG programs cannot be fetched.
 
@@ -52,11 +61,7 @@ class NoTvgIdError(Exception):
     """
     def __init__(self, channel_id: int):
         self.channel_id = channel_id
-        super().__init__(
-            f"Channel {channel_id} has no TVG-ID configured. "
-            f"Set the TVG-ID in Dispatcharr (open channel \u2192 Use EPG TVG-ID) "
-            f"to enable EPG program matching."
-        )
+        super().__init__(missing_tvg_id_message(channel_id))
 # ──────────────────────────────────────────────────────────────────────────
 
 
@@ -2589,8 +2594,8 @@ class SchedulingService:
 
             except Exception as e:
                 failed_count += 1
-                errors.append(f"Rule {idx + 1} ('{rule_data.get('name', 'unknown')}'): {str(e)}")
-                logger.warning(f"Failed to import rule: {errors[-1]}")
+                logger.warning("Failed to import rule %s: %s", idx + 1, e, exc_info=True)
+                errors.append(f"Rule {idx + 1}: Import failed. Check the server log for details.")
 
         result = {
             'imported': imported_count,

@@ -158,8 +158,9 @@ class SidecarLoopDetector:
 
     def _simple_hash(self, img):
         img = img.convert('L').resize((8, 8), Image.Resampling.LANCZOS)
-        avg = sum(img.getdata()) / 64
-        return sum(1 << i for i, v in enumerate(img.getdata()) if v > avg)
+        pixels = img.get_flattened_data()
+        avg = sum(pixels) / 64
+        return sum(1 << i for i, v in enumerate(pixels) if v > avg)
 
 # --- Synthetic Stream Generation ---
 

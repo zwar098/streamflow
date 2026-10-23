@@ -2,6 +2,9 @@ import unittest
 import io
 import time
 import collections
+import itertools
+import warnings
+from unittest.mock import patch
 from PIL import Image
 from apps.stream.sidecar_loop_detector import SidecarHash, SidecarLoopDetector
 
@@ -28,6 +31,33 @@ class TestSidecarLoopDetector(unittest.TestCase):
         
         parsed_frame = detector._read_ppm_frame()
         self.assertEqual(parsed_frame, frame)
+
+    def test_pipe_frames_decode_into_complete_visual_signatures(self):
+        frames = [self.create_ppm_frame((90, 120, 150), position)
+                  for position in ((5, 5), (10, 10), (15, 15))]
+        detector = SidecarLoopDetector(MockPipe(b''.join(frames)))
+        ticks = itertools.count(100, 2)
+        with patch('apps.stream.sidecar_loop_detector.time.monotonic', side_effect=lambda: next(ticks)):
+            detector.run()
+
+        self.assertTrue(detector.is_closed)
+        self.assertEqual(len(detector.buffer), 3)
+        signatures = [signature for _, signature in detector.buffer]
+        for signature in signatures:
+            self.assertEqual(set(signature), {'phash', 'ahash', 'dhash', 'whash'})
+            self.assertTrue(all(len(str(value)) == 16 for value in signature.values()))
+        self.assertGreater(len({str(signature['phash']) for signature in signatures}), 1)
+        self.assertFalse(detector.is_looping())
+
+    def test_fallback_hash_reads_pixels_with_current_pillow(self):
+        image = Image.new('L', (8, 8), 0)
+        for x in range(8):
+            image.putpixel((x, 0), 255)
+        with warnings.catch_warnings(), patch('apps.stream.sidecar_loop_detector.imagehash', None):
+            warnings.simplefilter('error', DeprecationWarning)
+            signature = SidecarLoopDetector(MockPipe()).frame_signature(image)
+        self.assertIsInstance(signature, SidecarHash)
+        self.assertEqual(signature.value, 255)
 
     def test_loop_detection(self):
         # Create a sequence of 3 unique frames with unique dots

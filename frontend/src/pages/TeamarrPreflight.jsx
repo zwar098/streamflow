@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useState, useRef } from 'react'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card.jsx'
 import { Button } from '@/components/ui/button.jsx'
 import { Badge } from '@/components/ui/badge.jsx'
@@ -10,6 +10,8 @@ import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, 
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip.jsx'
 import { DropdownMenu, DropdownMenuCheckboxItem, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '@/components/ui/dropdown-menu.jsx'
 import { Accordion, AccordionContent, AccordionItem, AccordionTrigger } from '@/components/ui/accordion.jsx'
+import { PreflightStreamDetails } from '@/components/PreflightStreamDetails.jsx'
+import { useVisiblePolling } from '@/hooks/use-visible-polling.js'
 import { useToast } from '@/hooks/use-toast.js'
 import { teamarrPreflightAPI, automationAPI } from '@/services/api.js'
 import { collectTeamarrFilterOptions, parseFilterCsv, toggleFilterCsvTerm } from '@/lib/teamarr-preflight-filters.js'
@@ -46,7 +48,7 @@ const numberFields = [
   { key: 'poll_interval_seconds', label: 'Teamarr Poll Interval', suffix: 'sec', min: 15, max: 3600, description: 'How often StreamFlow reads Teamarr managed events. 30-60 sec keeps narrow event windows reliable.' },
   { key: 'preflight_offset_minutes', label: 'Preflight Offset', suffix: 'min', min: 1, max: 360, description: 'Main automatic check before start. 20 means the first check becomes due around -20 min.' },
   { key: 'post_start_grace_minutes', label: 'Post Start Grace', suffix: 'min', min: 0, max: 120, description: 'How long after start post-start offsets can still run.' },
-  { key: 'max_concurrent_checks', label: 'Concurrent Checks', suffix: 'max', min: 1, max: 10, description: 'Maximum Teamarr event checks running at the same time.' },
+  { key: 'max_concurrent_checks', label: 'Concurrent Game Checks', suffix: 'max', min: 1, max: 10, description: 'Games checked at once, including long loop tests. All games share Stream Checker\'s global worker limit and available provider connections. 1 checks games one at a time.' },
   { key: 'event_cooldown_minutes', label: 'Event Cooldown', suffix: 'min', min: 1, max: 10080, description: 'Prevents the same event bucket from repeating after it already ran.' },
 ]
 
@@ -354,11 +356,15 @@ export default function TeamarrPreflight() {
   const [recentEventPage, setRecentEventPage] = useState(1)
   const { toast } = useToast()
 
-  useEffect(() => {
-    loadData()
-    const interval = setInterval(loadStatus, 5000)
-    return () => clearInterval(interval)
-  }, [])
+  const initialPollLoaded = useRef(false)
+  useVisiblePolling(async signal => {
+    if (!initialPollLoaded.current) {
+      await loadData(signal)
+      if (!signal.aborted) initialPollLoaded.current = true
+    } else {
+      await loadStatus(signal)
+    }
+  }, 5000)
 
   useEffect(() => {
     setManagedEventPage(1)
@@ -479,9 +485,21 @@ export default function TeamarrPreflight() {
     due: 'due',
     no_check: 'without checks',
     past: 'past',
+    filtered: 'filtered',
     all: 'all',
   }
   const managedViewLabel = managedEventViewLabels[managedEventView] || 'managed'
+  const managedEventEmptyMessages = {
+    upcoming: 'No upcoming preflight items',
+    due: 'No preflight items are due',
+    no_check: 'No preflight items without checks',
+    past: 'No past preflight items',
+    filtered: 'No preflight items are excluded by the current filters',
+    all: 'No preflight items found',
+  }
+  const managedEventEmptyMessage = eventSearch.trim()
+    ? 'No preflight items match this search'
+    : (managedEventEmptyMessages[managedEventView] || 'No preflight items in this view')
   const managedEventSummary = eventSearch.trim()
     ? `${filteredUpcomingEvents.length} of ${viewFilteredUpcomingEvents.length} ${managedViewLabel} items (${allPreflightItemsCount} all)`
     : `${viewFilteredUpcomingEvents.length} ${managedViewLabel} items (${allPreflightItemsCount} all)`
@@ -621,13 +639,14 @@ export default function TeamarrPreflight() {
     setExcludeLeagues((nextConfig.exclude_leagues || []).join(', '))
   }
 
-  const loadData = async () => {
+  const loadData = async (signal) => {
     try {
-      const configResponse = await teamarrPreflightAPI.getConfig()
+      const configResponse = await teamarrPreflightAPI.getConfig(signal ? { signal } : undefined)
       const [statusResponse, profilesResponse] = await Promise.all([
-        teamarrPreflightAPI.getStatus(),
-        automationAPI.getProfiles(),
+        teamarrPreflightAPI.getStatus(signal ? { signal } : undefined),
+        automationAPI.getProfiles(signal ? { signal } : undefined),
       ])
+      if (signal?.aborted) return
       const nextConfig = configResponse.data || {}
       setConfig(nextConfig)
       setEditedConfig(nextConfig)
@@ -635,6 +654,7 @@ export default function TeamarrPreflight() {
       setStatus(statusResponse.data || {})
       setProfiles(normalizeProfiles(profilesResponse.data))
     } catch (err) {
+      if (signal?.aborted) return
       console.error('Failed to load Teamarr preflight data:', err)
       toast({
         title: 'Error',
@@ -646,11 +666,13 @@ export default function TeamarrPreflight() {
     }
   }
 
-  const loadStatus = async () => {
+  const loadStatus = async (signal) => {
     try {
-      const response = await teamarrPreflightAPI.getStatus()
+      const response = await teamarrPreflightAPI.getStatus(signal ? { signal } : undefined)
+      if (signal?.aborted) return
       setStatus(response.data || {})
     } catch (err) {
+      if (signal?.aborted) return
       console.error('Failed to load Teamarr preflight status:', err)
     }
   }
@@ -779,7 +801,7 @@ export default function TeamarrPreflight() {
               <ChevronDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
             </Button>
           </DropdownMenuTrigger>
-          <DropdownMenuContent align="start" className="max-h-72 w-[--radix-dropdown-menu-trigger-width] overflow-y-auto">
+          <DropdownMenuContent align="start" className="max-h-72 w-(--radix-dropdown-menu-trigger-width) overflow-y-auto">
             {options.length === 0 ? (
               <DropdownMenuItem disabled>No options</DropdownMenuItem>
             ) : (
@@ -1029,14 +1051,14 @@ export default function TeamarrPreflight() {
               <div className="flex min-h-[116px] items-start justify-between gap-5 rounded-md border border-border p-4">
                 <div className="min-w-0 space-y-1">
                   <Label className="text-base">Enabled</Label>
-                  <p className="max-w-[22rem] text-sm leading-snug text-muted-foreground">Auto-starts with the backend</p>
+                  <p className="max-w-88 text-sm leading-snug text-muted-foreground">Auto-starts with the backend</p>
                 </div>
                 <Switch className="mt-1 shrink-0" checked={enabled} onCheckedChange={(value) => updateConfigValue('enabled', value)} />
               </div>
               <div className="flex min-h-[116px] items-start justify-between gap-5 rounded-md border border-border p-4">
                 <div className="min-w-0 space-y-1">
                   <Label className="text-base">Managed Events</Label>
-                  <p className="max-w-[28rem] text-sm leading-snug text-muted-foreground">Reads Teamarr managed event channels and queues targeted event checks</p>
+                  <p className="max-w-md text-sm leading-snug text-muted-foreground">Reads Teamarr managed event channels and queues targeted event checks</p>
                 </div>
                 <Switch
                   className="mt-1 shrink-0"
@@ -1047,7 +1069,7 @@ export default function TeamarrPreflight() {
               <div className="flex min-h-[116px] items-start justify-between gap-5 rounded-md border border-border p-4">
                 <div className="min-w-0 space-y-1">
                   <Label className="text-base">Static Teams</Label>
-                  <p className="max-w-[28rem] text-sm leading-snug text-muted-foreground">
+                  <p className="max-w-md text-sm leading-snug text-muted-foreground">
                     Uses Teamarr teams with matching Dispatcharr channels; queues only when Teamarr shows a real upcoming or live game window
                   </p>
                 </div>
@@ -1060,7 +1082,7 @@ export default function TeamarrPreflight() {
               <div className="flex min-h-[116px] items-start justify-between gap-5 rounded-md border border-border p-4">
                 <div className="min-w-0 space-y-1">
                   <Label className="text-base">Queue Events During Active Checks</Label>
-                  <p className="max-w-[28rem] text-sm leading-snug text-muted-foreground">
+                  <p className="max-w-md text-sm leading-snug text-muted-foreground">
                     On queues due Teamarr event checks during Automation or Stream Checker runs; off waits and does not queue new event checks until active work is done
                   </p>
                 </div>
@@ -1293,7 +1315,7 @@ export default function TeamarrPreflight() {
               />
             </div>
             <Select value={sourceView} onValueChange={setSourceView}>
-              <SelectTrigger>
+              <SelectTrigger aria-label="Preflight source">
                 <SelectValue placeholder="Source" />
               </SelectTrigger>
               <SelectContent>
@@ -1303,7 +1325,7 @@ export default function TeamarrPreflight() {
               </SelectContent>
             </Select>
             <Select value={managedEventView} onValueChange={setManagedEventView}>
-              <SelectTrigger>
+              <SelectTrigger aria-label="Preflight view">
                 <SelectValue placeholder="Event view" />
               </SelectTrigger>
               <SelectContent>
@@ -1311,6 +1333,7 @@ export default function TeamarrPreflight() {
                 <SelectItem value="due">Due</SelectItem>
                 <SelectItem value="no_check">No Check</SelectItem>
                 <SelectItem value="past">Past</SelectItem>
+                <SelectItem value="filtered">Filtered</SelectItem>
                 <SelectItem value="all">All</SelectItem>
               </SelectContent>
             </Select>
@@ -1328,7 +1351,7 @@ export default function TeamarrPreflight() {
               {preflightItems.length === 0 ? (
                 <p className="text-sm text-muted-foreground">No preflight items found</p>
               ) : filteredUpcomingEvents.length === 0 ? (
-                <p className="text-sm text-muted-foreground">No preflight items match this search</p>
+                <p className="text-sm text-muted-foreground">{managedEventEmptyMessage}</p>
               ) : (
                 <TooltipProvider delayDuration={200}>
                   <div className="space-y-3">
@@ -1412,6 +1435,7 @@ export default function TeamarrPreflight() {
                             </>
                           ) : null}
                         </div>
+                        <PreflightStreamDetails key={lastPreflightEvent?.details?.inspection_id || 'no-inspection'} event={lastPreflightEvent} />
                         {healthAlert ? (
                           <div
                             className={`mt-3 flex items-start gap-2 rounded-md border px-3 py-2 text-sm ${

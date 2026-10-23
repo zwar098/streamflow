@@ -30,14 +30,20 @@ from apps.core.api_utils import _get_base_url
 from apps.stream.stream_checker_service import get_stream_checker_service
 from apps.stream.shadow_blank_monitor_service import get_shadow_blank_monitor_service
 from apps.stream.teamarr_preflight_service import get_teamarr_preflight_service
+from apps.stream.playback_stability_service import get_playback_stability_service
+from apps.api.playback_stability_handlers import (
+    playback_stability_config_response, playback_stability_status_response,
+)
 from apps.automation.scheduling_service import get_scheduling_service
 from apps.background.scheduling_workers import (
     epg_refresh_processor_loop,
     scheduled_event_processor_loop,
     udi_refresh_processor_loop,
 )
+from apps.background.setup_startup import serialized_processor_start, start_setup_processors
 from apps.stream.udp_proxy import UDPProxyManager
 from apps.config.dispatcharr_config import get_dispatcharr_config
+from apps.config.openstream_config import get_openstream_config
 from apps.channels.channel_order_manager import get_channel_order_manager
 from apps.channels.repository import UdiChannelRepository
 from apps.channels.service import ChannelService
@@ -177,6 +183,7 @@ from apps.api.teamarr_preflight_handlers import (
     force_teamarr_preflight_event_response,
     get_teamarr_preflight_config_response,
     get_teamarr_preflight_status_response,
+    get_teamarr_preflight_inspection_response,
     run_teamarr_preflight_once_response,
     start_teamarr_preflight_response,
     stop_teamarr_preflight_response,
@@ -226,6 +233,11 @@ from apps.api.legacy_automation_handlers import (
     get_global_automation_settings_legacy_response,
     update_automation_profile_legacy_response,
     update_global_automation_settings_legacy_response,
+)
+from apps.api.openstream_handlers import (
+    get_openstream_config_response,
+    test_openstream_connection_response,
+    update_openstream_config_response,
 )
 from apps.api.dispatcharr_handlers import (
     get_dispatcharr_config_response,
@@ -329,6 +341,8 @@ static_folder_local = Path(__file__).parent.parent.parent.parent / 'frontend' / 
 
 static_folder = static_folder_docker if static_folder_docker.exists() else static_folder_local
 app = Flask(__name__, static_folder=None)
+from apps.api.status_etags import install_status_etags
+install_status_etags(app)
 CORS(app)  # Enable CORS for React frontend
 
 
@@ -519,6 +533,7 @@ def scheduled_event_processor():
     )
 
 
+@serialized_processor_start
 def start_scheduled_event_processor():
     """Start the background thread for processing scheduled events."""
     global scheduled_event_processor_thread, scheduled_event_processor_running, scheduled_event_processor_wake
@@ -586,6 +601,7 @@ def epg_refresh_processor():
     )
 
 
+@serialized_processor_start
 def start_epg_refresh_processor():
     """Start the background thread for periodic EPG refresh."""
     global epg_refresh_thread, epg_refresh_running, epg_refresh_wake
@@ -650,6 +666,7 @@ def udi_refresh_processor():
     )
 
 
+@serialized_processor_start
 def start_udi_refresh_processor():
     """Start the background thread for scheduled UDI cache refreshes."""
     global udi_refresh_thread, udi_refresh_running, udi_refresh_wake
@@ -692,6 +709,16 @@ def stop_udi_refresh_processor():
 
     logger.info("UDI refresh processor stopped")
     return True
+
+
+def start_setup_background_processors():
+    """Wire required setup workers; their lifecycle stays in the background module."""
+    start_setup_processors(
+        is_configured=check_wizard_complete,
+        start_scheduled_events=start_scheduled_event_processor,
+        start_epg_refresh=start_epg_refresh_processor,
+        start_udi_refresh=start_udi_refresh_processor,
+    )
 
 
 @app.route('/', methods=['GET'])
@@ -1402,6 +1429,7 @@ def get_setup_wizard_status():
         get_automation_config_manager=get_automation_config_manager,
         get_dispatcharr_config=get_dispatcharr_config,
         get_udi_manager=get_udi_manager,
+        on_initialized=start_setup_background_processors,
     )
 
 @app.route('/api/test-match-live', methods=['POST'])
@@ -1471,6 +1499,7 @@ def update_dispatcharr_config_endpoint():
         payload=request.get_json(silent=True),
         get_dispatcharr_config=get_dispatcharr_config,
         get_udi_manager=get_udi_manager,
+        on_initialized=start_setup_background_processors,
     )
 
 @app.route('/api/dispatcharr/test-connection', methods=['POST'])
@@ -1479,6 +1508,29 @@ def test_dispatcharr_connection():
     return test_dispatcharr_connection_response(
         payload=request.get_json(silent=True),
         get_dispatcharr_config=get_dispatcharr_config,
+    )
+
+@app.route('/api/openstream/config', methods=['GET'])
+def get_openstream_config_endpoint():
+    """Get the OpenStream monitoring configuration (without the API key)."""
+    return get_openstream_config_response(
+        get_openstream_config=get_openstream_config,
+    )
+
+@app.route('/api/openstream/config', methods=['PUT'])
+def update_openstream_config_endpoint():
+    """Update the OpenStream API key / test URL."""
+    return update_openstream_config_response(
+        payload=request.get_json(silent=True),
+        get_openstream_config=get_openstream_config,
+    )
+
+@app.route('/api/openstream/test-connection', methods=['POST'])
+def test_openstream_connection():
+    """Test that an OpenStream server accepts the API key."""
+    return test_openstream_connection_response(
+        payload=request.get_json(silent=True),
+        get_openstream_config=get_openstream_config,
     )
 
 @app.route('/api/dispatcharr/initialization-status', methods=['GET'])
@@ -1785,6 +1837,13 @@ def get_teamarr_preflight_status():
     return get_teamarr_preflight_status_response(
         get_service=get_teamarr_preflight_service,
     )
+
+@app.route('/api/teamarr-preflight/inspections/<inspection_id>', methods=['GET'])
+def get_teamarr_preflight_inspection(inspection_id):
+    return get_teamarr_preflight_inspection_response(
+        inspection_id=inspection_id, get_service=get_teamarr_preflight_service,
+    )
+
 
 @app.route('/api/teamarr-preflight/start', methods=['POST'])
 def start_teamarr_preflight():
@@ -2637,6 +2696,18 @@ def create_session_from_event(event_id):
 
 # ==================== Settings API ====================
 
+@app.route('/api/playback-stability/config', methods=['GET', 'PUT'])
+def playback_stability_config():
+    return playback_stability_config_response(
+        method=request.method, payload=request.get_json(silent=True),
+        get_service=get_playback_stability_service,
+    )
+
+
+@app.route('/api/playback-stability/status', methods=['GET'])
+def playback_stability_status():
+    return playback_stability_status_response(get_service=get_playback_stability_service)
+
 @app.route('/api/settings/session', methods=['GET', 'POST'])
 def handle_session_settings():
     """Get or update session settings (like review duration)."""
@@ -2756,6 +2827,10 @@ if __name__ == '__main__':
                 except Exception:
                     pass
                     
+                try:
+                    get_playback_stability_service().stop()
+                except Exception:
+                    logger.exception('Failed to stop Playback Stability recorder')
                 logger.info("Graceful shutdown complete. Exiting.")
                 sys.exit(0)
 
@@ -2819,6 +2894,12 @@ if __name__ == '__main__':
             logger.info("Stream monitoring service auto-started")
         except Exception as e:
             logger.error(f"Failed to auto-start stream monitoring service: {e}")
+
+        try:
+            if check_wizard_complete():
+                get_playback_stability_service().start()
+        except Exception:
+            logger.exception('Failed to start Playback Stability recorder')
 
         try:
             if not check_wizard_complete():

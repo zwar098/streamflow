@@ -82,6 +82,39 @@ describe('Teamarr preflight event search helpers', () => {
     expect(filterTeamarrEventsByView(events, 'all')).toEqual(events)
   })
 
+  it('hides filtered events and teams from normal views while retaining explicit diagnostic views', () => {
+    const excluded = [
+      { preflight_kind: 'event', event_name: 'Excluded sport', sport: 'baseball', state: 'filtered' },
+      { preflight_kind: 'event', event_name: 'Excluded league', league: 'nba', state: 'filtered', last_preflight_event: { type: 'preflight_completed' } },
+      { preflight_kind: 'team', team_name: 'Outside include scope', state: 'filtered' },
+      { event_name: 'Legacy event without kind', state: 'filtered' },
+    ]
+    const candidates = [...events, ...excluded]
+
+    for (const view of ['upcoming', 'no_check', 'due', 'past']) {
+      expect(filterTeamarrEventsByView(candidates, view)).toEqual(filterTeamarrEventsByView(events, view))
+    }
+    expect(filterTeamarrEventsByView(candidates, 'filtered')).toEqual(excluded)
+    expect(filterTeamarrEventsByView(candidates, 'all')).toEqual(candidates)
+  })
+
+  it('searches and paginates the selected view without leaking filtered items into normal lists', () => {
+    const candidates = Array.from({ length: 24 }, (_, index) => ({
+      preflight_kind: index % 2 ? 'team' : 'event',
+      event_name: `League entry ${index}`,
+      state: index < 12 ? 'filtered' : 'due',
+    }))
+    const visible = filterTeamarrEventsBySearch(filterTeamarrEventsByView(candidates, 'upcoming'), 'league')
+    const filtered = filterTeamarrEventsBySearch(filterTeamarrEventsByView(candidates, 'filtered'), 'league')
+
+    expect(visible).toHaveLength(12)
+    expect(filtered).toHaveLength(12)
+    expect(paginateTeamarrEvents(visible, 2, 10)).toEqual(candidates.slice(22))
+    expect(paginateTeamarrEvents(filtered, 2, 10)).toEqual(candidates.slice(10, 12))
+    expect(filterTeamarrEventsByView([], 'filtered')).toEqual([])
+    expect(filterTeamarrEventsByView(events, 'filtered')).toEqual([])
+  })
+
   it('keeps static team diagnostics out of the default upcoming view', () => {
     const config = { preflight_offset_minutes: 20, poll_interval_seconds: 30 }
     const staticTeams = [

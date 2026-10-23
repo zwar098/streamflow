@@ -275,7 +275,7 @@ class SidecarLoopDetector:
         """Fallback simple hash if imagehash not installed"""
         # Very crude average hash
         img = img.convert('L').resize((8, 8), Image.Resampling.LANCZOS)
-        pixels = list(img.getdata())
+        pixels = img.get_flattened_data()
         avg = sum(pixels) / 64
         hash_val = sum(1 << i for i, v in enumerate(pixels) if v > avg)
         return SidecarHash(hash_val)

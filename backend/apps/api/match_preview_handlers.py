@@ -243,6 +243,28 @@ def bulk_match_count_response(
             if not has_regex and not has_tvg:
                 continue
 
+            # This preparation depends only on the channel, never on a stream.
+            # Repeating substitution and safety validation for every stream can
+            # exhaust API workers when users sort/filter a large channel list.
+            prepared_patterns = []
+            if "regex" in match_priority_order:
+                escaped_channel_name = re.escape(channel_name)
+                for pattern_obj in normalized_patterns:
+                    pattern = pattern_obj.get("pattern", "")
+                    if not pattern:
+                        continue
+                    search_pattern = whitespace_pattern.sub(
+                        r"\\s+", pattern.replace("CHANNEL_NAME", escaped_channel_name)
+                    )
+                    try:
+                        if is_dangerous_regex(search_pattern):
+                            continue
+                        # Validate syntax once too, rather than raising per stream.
+                        search_user_regex(search_pattern, "", case_sensitive=case_sensitive)
+                    except re.error:
+                        continue
+                    prepared_patterns.append((search_pattern, pattern_obj.get("m3u_accounts")))
+
             match_count = 0
 
             for stream in all_streams:
@@ -269,12 +291,7 @@ def bulk_match_count_response(
                     elif match_type == "regex" and has_regex:
                         search_name = stream_name
 
-                        for pattern_obj in normalized_patterns:
-                            pattern = pattern_obj.get("pattern", "")
-                            if not pattern:
-                                continue
-
-                            pattern_m3u_accounts = pattern_obj.get("m3u_accounts")
+                        for search_pattern, pattern_m3u_accounts in prepared_patterns:
                             if pattern_m3u_accounts and len(pattern_m3u_accounts) > 0:
                                 if (
                                     stream_m3u_account is None
@@ -282,22 +299,13 @@ def bulk_match_count_response(
                                 ):
                                     continue
 
-                            escaped_channel_name = re.escape(channel_name)
-                            substituted_pattern = pattern.replace("CHANNEL_NAME", escaped_channel_name)
-                            search_pattern = substituted_pattern
-                            search_pattern = whitespace_pattern.sub(r"\\s+", search_pattern)
-                            try:
-                                if is_dangerous_regex(search_pattern):
-                                    continue
-                                if search_user_regex(
-                                    search_pattern,
-                                    search_name,
-                                    case_sensitive=case_sensitive,
-                                ):
-                                    matched = True
-                                    break
-                            except re.error:
-                                continue
+                            if search_user_regex(
+                                search_pattern,
+                                search_name,
+                                case_sensitive=case_sensitive,
+                            ):
+                                matched = True
+                                break
 
                 if matched:
                     match_count += 1

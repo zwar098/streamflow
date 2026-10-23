@@ -22,6 +22,7 @@ from typing import Any, Callable
 
 from flask import jsonify
 
+from apps.channels.active_profile import automation_profile_summary
 from apps.core.logging_config import setup_logging
 
 logger = setup_logging(__name__)
@@ -49,20 +50,7 @@ def get_channel_active_profile_response(
 
         # --- Automation profile (period-based resolution) ---
         # Mirrors check_single_channel Step 2: get_effective_configuration
-        automation_result = {"profile_name": None, "period_name": None, "source": None}
-        config = automation_config.get_effective_configuration(channel_id, group_id)
-        if config:
-            profile = config.get("profile")
-            automation_result["profile_name"] = profile.get("name") if profile else None
-            automation_result["period_name"] = config.get("period_name")
-
-            # Source: channel-level assignment beats group-level
-            channel_periods = automation_config.get_channel_periods(channel_id)
-            active_period_id = config.get("period_id")
-            if active_period_id and str(active_period_id) in channel_periods:
-                automation_result["source"] = "channel"
-            else:
-                automation_result["source"] = "group"
+        automation_result = automation_profile_summary(automation_config, channel_id, group_id)
 
         # --- EPG scheduled profile override ---
         # Mirrors check_single_channel Step 1: get_effective_epg_scheduled_profile

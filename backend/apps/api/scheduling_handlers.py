@@ -68,7 +68,7 @@ def get_epg_grid_response(*, force_refresh: bool, get_scheduling_service: Callab
 
 def get_channel_programs_response(*, channel_id: int, get_scheduling_service: Callable[[], Any]):
     """Handle retrieval of EPG programs for one channel."""
-    from apps.automation.scheduling_service import NoTvgIdError
+    from apps.automation.scheduling_service import NoTvgIdError, missing_tvg_id_message
     try:
         service = get_scheduling_service()
         programs = service.get_programs_by_channel(channel_id)
@@ -78,7 +78,7 @@ def get_channel_programs_response(*, channel_id: int, get_scheduling_service: Ca
         return jsonify({
             "programs": [],
             "no_tvg_id": True,
-            "message": str(exc),
+            "message": missing_tvg_id_message(channel_id),
         }), 200
     except Exception as exc:
         logger.error(f"Error fetching programs for channel {channel_id}: {exc}")
@@ -242,7 +242,7 @@ def update_auto_create_rule_response(
 
 def test_auto_create_rule_response(*, payload: Any, get_scheduling_service: Callable[[], Any]):
     """Handle regex testing against EPG data for selected channels and groups."""
-    from apps.automation.scheduling_service import NoTvgIdError
+    from apps.automation.scheduling_service import NoTvgIdError, missing_tvg_id_message
     try:
         schema = AutoCreateRuleTestSchema.from_payload(payload)
 
@@ -265,7 +265,7 @@ def test_auto_create_rule_response(*, payload: Any, get_scheduling_service: Call
             "matches": 0,
             "programs": [],
             "no_tvg_id": True,
-            "message": str(exc),
+            "message": missing_tvg_id_message(exc.channel_id),
         }), 200
 
     except ValidationError as exc:
