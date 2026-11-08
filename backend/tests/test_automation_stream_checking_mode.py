@@ -46,12 +46,7 @@ class TestAutomationStreamCheckingMode(unittest.TestCase):
             
             # Mock stream checker service to return stream_checking_mode = True
             mock_stream_checker = Mock()
-            mock_status = {
-                'stream_checking_mode': True,
-                'checking': False,
-                'queue': {'queue_size': 1}  # One channel in queue
-            }
-            mock_stream_checker.get_status.return_value = mock_status
+            mock_stream_checker.is_busy.return_value = True
             
             # Mock the import and service getter
             with patch('stream_checker_service.get_stream_checker_service', return_value=mock_stream_checker):
@@ -67,8 +62,9 @@ class TestAutomationStreamCheckingMode(unittest.TestCase):
                 # Verify that refresh_playlists was NOT called
                 manager.refresh_playlists.assert_not_called()
                 
-                # Verify that get_status was called to check stream_checking_mode
-                mock_stream_checker.get_status.assert_called_once()
+                # The wait polls the cheap busy predicate, never the full status.
+                mock_stream_checker.is_busy.assert_called_once()
+                mock_stream_checker.get_status.assert_not_called()
 
                 run_status = manager.get_status()["run_status"]
                 self.assertEqual(run_status["state"], "queued")
@@ -82,11 +78,7 @@ class TestAutomationStreamCheckingMode(unittest.TestCase):
             manager = AutomatedStreamManager(config_file=self.config_file)
 
             mock_stream_checker = Mock()
-            mock_stream_checker.get_status.return_value = {
-                'stream_checking_mode': True,
-                'checking': False,
-                'queue': {'queue_size': 0},
-            }
+            mock_stream_checker.is_busy.return_value = True
 
             with patch('stream_checker_service.get_stream_checker_service', return_value=mock_stream_checker):
                 manager.refresh_playlists = Mock()
@@ -94,7 +86,8 @@ class TestAutomationStreamCheckingMode(unittest.TestCase):
                 manager.run_automation_cycle(forced=True, forced_period_id="1")
 
                 manager.refresh_playlists.assert_not_called()
-                mock_stream_checker.get_status.assert_called_once()
+                mock_stream_checker.is_busy.assert_called_once()
+                mock_stream_checker.get_status.assert_not_called()
                 self.assertTrue(manager.force_next_run)
                 self.assertEqual(manager.forced_period_id, "1")
 
@@ -108,11 +101,7 @@ class TestAutomationStreamCheckingMode(unittest.TestCase):
         with patch('automated_stream_manager.CONFIG_DIR', Path(self.temp_dir)):
             manager = AutomatedStreamManager(config_file=self.config_file)
             mock_stream_checker = Mock()
-            mock_stream_checker.get_status.return_value = {
-                'stream_checking_mode': False,
-                'checking': False,
-                'queue': {'queue_size': 0},
-            }
+            mock_stream_checker.is_busy.return_value = False
             mock_stream_checker.begin_automation_cycle_operation.return_value = False
 
             with patch(
@@ -141,24 +130,16 @@ class TestAutomationStreamCheckingMode(unittest.TestCase):
             observed_queued = []
             status_calls = 0
 
-            def checker_status():
+            def checker_busy():
                 nonlocal status_calls
                 status_calls += 1
                 if status_calls == 1:
-                    return {
-                        'stream_checking_mode': True,
-                        'checking': True,
-                        'queue': {'queue_size': 1},
-                    }
+                    return True
                 observed_queued.append(manager.get_status()['run_status'])
-                return {
-                    'stream_checking_mode': False,
-                    'checking': False,
-                    'queue': {'queue_size': 0},
-                }
+                return False
 
             mock_stream_checker = Mock()
-            mock_stream_checker.get_status.side_effect = checker_status
+            mock_stream_checker.is_busy.side_effect = checker_busy
             mock_stream_checker.begin_automation_cycle_operation.return_value = True
 
             with patch(
@@ -168,6 +149,7 @@ class TestAutomationStreamCheckingMode(unittest.TestCase):
                 manager.run_automation_cycle()
 
             self.assertEqual(status_calls, 2)
+            mock_stream_checker.get_status.assert_not_called()
             mocked_sleep.assert_called_once_with(0.25)
             self.assertEqual(len(observed_queued), 1)
             queued = observed_queued[0]
@@ -190,15 +172,11 @@ class TestAutomationStreamCheckingMode(unittest.TestCase):
 
             mock_stream_checker = Mock()
 
-            def checker_status():
+            def checker_busy():
                 manager.automation_running = False
-                return {
-                    'stream_checking_mode': True,
-                    'checking': True,
-                    'queue': {'queue_size': 1},
-                }
+                return True
 
-            mock_stream_checker.get_status.side_effect = checker_status
+            mock_stream_checker.is_busy.side_effect = checker_busy
 
             with patch(
                 'stream_checker_service.get_stream_checker_service',
@@ -271,12 +249,7 @@ class TestAutomationStreamCheckingMode(unittest.TestCase):
             
             # Mock stream checker service to return stream_checking_mode = False
             mock_stream_checker = Mock()
-            mock_status = {
-                'stream_checking_mode': False,
-                'checking': False,
-                'queue': {'queue_size': 0}
-            }
-            mock_stream_checker.get_status.return_value = mock_status
+            mock_stream_checker.is_busy.return_value = False
             mock_stream_checker.begin_automation_cycle_operation.return_value = True
             
             # Mock the import and service getter
@@ -294,8 +267,8 @@ class TestAutomationStreamCheckingMode(unittest.TestCase):
                 # Verify that refresh_playlists WAS called
                 manager.refresh_playlists.assert_called_once()
                 
-                # Verify that get_status was called to check stream_checking_mode
-                mock_stream_checker.get_status.assert_called_once()
+                mock_stream_checker.is_busy.assert_called_once()
+                mock_stream_checker.get_status.assert_not_called()
                 mock_stream_checker.begin_automation_cycle_operation.assert_called_once_with()
                 mock_stream_checker.end_automation_cycle_operation.assert_called_once_with()
     
@@ -306,12 +279,7 @@ class TestAutomationStreamCheckingMode(unittest.TestCase):
             
             # Mock stream checker service
             mock_stream_checker = Mock()
-            mock_status = {
-                'stream_checking_mode': True,
-                'checking': False,
-                'queue': {'queue_size': 0}
-            }
-            mock_stream_checker.get_status.return_value = mock_status
+            mock_stream_checker.is_busy.return_value = True
             
             # Mock logger to track logging calls
             with patch('automated_stream_manager.logger') as mock_logger:

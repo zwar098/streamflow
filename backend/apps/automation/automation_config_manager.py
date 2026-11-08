@@ -1120,6 +1120,18 @@ class AutomationConfigManager:
         result = self._get_config_dict("group_period_assignments", {})
         return result if isinstance(result, dict) else {}
 
+    def get_assigned_period_ids(self) -> set:
+        """Return ids of every period assigned to at least one channel or group."""
+        assigned: set = set()
+        for key in ("channel_period_assignments", "group_period_assignments"):
+            assignments = self._get_config_dict(key, {})
+            if not isinstance(assignments, dict):
+                continue
+            for period_map in assignments.values():
+                if isinstance(period_map, dict):
+                    assigned.update(str(period_id) for period_id in period_map)
+        return assigned
+
     def get_period_groups(self, period_id: str) -> List[int]:
         """Return the list of group IDs that have this period assigned."""
         assignments = self._get_config_dict("group_period_assignments", {})

@@ -82,7 +82,7 @@ def test_due_period_does_not_inherit_another_period_profile(monkeypatch):
     monkeypatch.setattr("apps.automation.automated_stream_manager.get_udi_manager", lambda: mock_udi)
 
     mock_stream_checker = Mock()
-    mock_stream_checker.get_status.return_value = {"stream_checking_mode": False}
+    mock_stream_checker.is_busy.return_value = False
     mock_stream_checker.check_channels_synchronously.return_value = {}
     monkeypatch.setattr(
         "apps.stream.stream_checker_service.get_stream_checker_service",
@@ -169,7 +169,7 @@ def test_connectivity_retry_resumes_quality_without_provider_refresh_or_matching
     )
 
     stream_checker = Mock()
-    stream_checker.get_status.return_value = {"stream_checking_mode": False}
+    stream_checker.is_busy.return_value = False
     stream_checker._require_quality_check_connectivity.return_value = None
     stream_checker.config.get.side_effect = lambda key, default=None: default
     stream_checker.abort_current_check = threading.Event()

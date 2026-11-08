@@ -58,7 +58,7 @@ def _build_manager_for_cycle(monkeypatch, *, m3u_enabled: bool) -> AutomatedStre
     )
 
     mock_stream_checker = Mock()
-    mock_stream_checker.get_status.return_value = {"stream_checking_mode": False}
+    mock_stream_checker.is_busy.return_value = False
     mock_stream_checker.check_channels_synchronously.return_value = {}
     monkeypatch.setattr(
         "apps.stream.stream_checker_service.get_stream_checker_service",

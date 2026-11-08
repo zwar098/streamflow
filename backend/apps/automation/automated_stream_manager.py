@@ -1482,6 +1482,10 @@ class AutomatedStreamManager:
         self.running = False
         self.state_file = CONFIG_DIR / "automation_state.json"
         self.last_playlist_update = None
+        # Outcome of the most recent scheduler tick that had nothing to run.
+        # Kept apart from _run_status so a no-op tick never replaces the status
+        # of the last real run.
+        self.last_scheduler_tick: Optional[Dict[str, Any]] = None
         self._period_skip_history = {}
         self._scheduler_retry_state = {}
         self.period_last_run = self._load_state()  # Tracks last run time per period ID
@@ -3480,6 +3484,7 @@ class AutomatedStreamManager:
             "config": copy.deepcopy(self.config),
             "run_status": self.get_run_status(),
             "scheduler_retry": self._scheduler_retry_status(),
+            "last_scheduler_tick": copy.copy(self.last_scheduler_tick),
         }
     
     def _is_dead_stream_removal_enabled(self) -> bool:
@@ -5864,8 +5869,124 @@ class AutomatedStreamManager:
             )
             return 0.0
     
+    def _record_scheduler_tick(self, outcome: str, message: str, **details: Any) -> None:
+        """Remember why a scheduler tick did nothing, without publishing a run."""
+        self.last_scheduler_tick = {
+            "at": datetime.now().isoformat(),
+            "outcome": outcome,
+            "message": message,
+            **details,
+        }
+
+    def _has_due_automation_work(self, automation_config) -> bool:
+        """True when any enabled, assigned period is due (including due retries).
+
+        Periods that no channel or group uses are ignored: they are never
+        recorded as run, so they would stay "due" forever and defeat the gate.
+        Every eligible period is evaluated (no short-circuit) so schedule
+        bookkeeping such as first-run initialisation happens exactly as it
+        would during discovery.
+        """
+        assigned_period_ids = automation_config.get_assigned_period_ids()
+        if not assigned_period_ids:
+            return False
+        due_cache: Dict[str, bool] = {}
+        any_due = False
+        for period in automation_config.get_all_periods() or []:
+            if not isinstance(period, dict):
+                continue
+            period_id = period.get("id")
+            if period_id is None or str(period_id) not in assigned_period_ids:
+                continue
+            if period.get("enabled") is False:
+                continue
+            if self._is_period_due_for_cycle(period_id, period, due_cache):
+                any_due = True
+        return any_due
+
+    def _drop_orphaned_scheduler_retries(self, live_period_ids: set) -> None:
+        """Forget retry state for periods that are no longer enabled and assigned."""
+        retry_state = getattr(self, "_scheduler_retry_state", None)
+        if not retry_state:
+            return
+        orphaned = [pid for pid in list(retry_state) if str(pid) not in live_period_ids]
+        for pid in orphaned:
+            retry_state.pop(pid, None)
+        if orphaned:
+            self._save_state()
+
+    def _scheduler_tick_should_run(self) -> bool:
+        """Decide whether a plain scheduler tick has any work, publishing nothing.
+
+        Every 60 seconds the loop calls ``run_automation_cycle``. Most ticks have
+        nothing due; they used to publish a new run, then wait behind a busy
+        Stream Checker (minutes, polling its full status), and only then
+        discover that nothing was due. Deciding up front keeps the status of the
+        last real run intact and avoids the wait. Any unexpected error falls
+        back to the previous behaviour (run the cycle).
+        """
+        legacy_config_file_mode = (
+            getattr(self, "_explicit_config_file", False)
+            or Path(CONFIG_DIR) != Path('/app/data')
+        )
+        if legacy_config_file_mode:
+            return True
+
+        try:
+            from apps.automation.automation_config_manager import get_automation_config_manager
+            automation_config = get_automation_config_manager()
+            global_settings = automation_config.get_global_settings()
+            current_enabled = bool(global_settings.get('regular_automation_enabled', False))
+
+            if not hasattr(self, '_was_automation_enabled'):
+                self._was_automation_enabled = current_enabled
+            if current_enabled and not self._was_automation_enabled:
+                logger.info("Automation system just enabled, resetting period last run states to wait")
+                self.period_last_run.clear()
+            self._was_automation_enabled = current_enabled
+
+            if not current_enabled:
+                logger.debug("Regular automation is disabled globally. Skipping cycle.")
+                self._record_scheduler_tick("disabled", "Regular automation is disabled")
+                return False
+
+            if self._is_maintenance_window_active(global_settings):
+                logger.debug("Maintenance window is active. Skipping automation cycle.")
+                self._record_scheduler_tick("maintenance", "Maintenance window is active")
+                return False
+
+            teamarr_event_window = self._get_active_teamarr_event_window(global_settings)
+            if teamarr_event_window:
+                event_name = teamarr_event_window.get("event_name") or "Teamarr event"
+                logger.info(
+                    "Teamarr event window is active for %s. Skipping automatic automation cycle.",
+                    event_name,
+                )
+                self._record_scheduler_tick(
+                    "teamarr_window",
+                    f"Teamarr event window active for {event_name}",
+                    event_name=event_name,
+                )
+                return False
+
+            if not self._has_due_automation_work(automation_config):
+                logger.debug("No automation periods are due. Skipping cycle.")
+                live_period_ids = {
+                    str(period.get("id"))
+                    for period in (automation_config.get_all_periods() or [])
+                    if isinstance(period, dict) and period.get("enabled") is not False
+                } & set(automation_config.get_assigned_period_ids())
+                self._drop_orphaned_scheduler_retries(live_period_ids)
+                self._record_scheduler_tick("nothing_due", "No automation periods were due")
+                return False
+        except Exception as exc:
+            logger.warning("Scheduler tick pre-check failed; running the cycle: %s", exc)
+        return True
+
     def run_automation_cycle(self, forced: bool = False, forced_period_id: str = None):
         """Run one complete automation cycle with profile support."""
+        if not forced and not forced_period_id and not self._scheduler_tick_should_run():
+            return
         self._start_run_status(forced=forced, forced_period_id=forced_period_id)
         # Determine if this is a forced run (manual trigger)
         # forced and forced_period_id are now passed as arguments
@@ -5950,8 +6071,7 @@ class AutomatedStreamManager:
             checker_waiting = False
             background_wait = bool(getattr(self, 'automation_running', False))
             while True:
-                status = stream_checker.get_status()
-                checker_active = bool(status.get('stream_checking_mode', False))
+                checker_active = bool(stream_checker.is_busy())
                 if not checker_active and stream_checker.begin_automation_cycle_operation():
                     automation_checker_reserved = True
                     if checker_waiting:
@@ -6157,7 +6277,6 @@ class AutomatedStreamManager:
 
             if not active_periods:
                 logger.debug("No channels with active automation periods found. Skipping cycle.")
-                self.last_playlist_update = datetime.now()
                 self._finish_run_status(
                     state="skipped",
                     stage="skipped",

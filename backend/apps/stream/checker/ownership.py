@@ -361,6 +361,30 @@ class CheckerOwnershipMixin:
             return True, action()
 
 
+    def is_busy(self) -> bool:
+        """Cheap, side-effect-free check for anything holding the checker.
+
+        Mirrors the conditions ``begin_automation_cycle_operation`` refuses on,
+        so a caller that is waiting for the checker can poll this instead of
+        building the full ``get_status()`` payload (queue history, stale
+        diagnostics, connectivity refresh) several times a second.
+        """
+        with self.lock:
+            with self.check_queue.lock:
+                return bool(
+                    getattr(self, '_automation_cycle_active', False)
+                    or self.checking
+                    or getattr(self, '_single_stream_check_active', False)
+                    or getattr(self, '_single_channel_check_active', False)
+                    or bool((self.sync_batch_state or {}).get('active'))
+                    or getattr(self, '_sync_batch_execution_active', False)
+                    or self.check_queue.queued
+                    or self.check_queue.in_progress
+                    or self.check_queue.stats.get('current_channel') is not None
+                    or getattr(self, '_active_queue_entry_executions', {})
+                )
+
+
     def begin_automation_cycle_operation(self) -> bool:
         """Atomically reserve Stream Checker ownership for a full automation cycle."""
         owner_thread_id = threading.get_ident()
