@@ -40,6 +40,10 @@ CONFIG_DIR = Path(os.environ.get("CONFIG_DIR", "/app/data"))
 CONFIG_FILE = CONFIG_DIR / "teamarr_preflight_config.json"
 MAX_EVENTS = 120
 MAX_UPCOMING_EVENTS = 1000
+# Same tolerance the widget applies to an overdue next-check time, and the same
+# list length it shows. Kept equal to apps.orchestration.widget_snapshot.
+NEXT_CHECK_TOLERANCE_SECONDS = 90
+UPCOMING_MAX = 3
 TEAMARR_PREFLIGHT_QUEUE_PRIORITY = 100
 ATTEMPT_STATE_KEY = "teamarr_preflight_attempt_state"
 ATTEMPT_STATE_VERSION = 1
@@ -295,6 +299,11 @@ def _parse_event_datetime(value: Any) -> Optional[datetime]:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
+
+
+def _timestamp_epoch(value: Any) -> Optional[float]:
+    parsed = _parse_event_datetime(value)
+    return parsed.timestamp() if parsed is not None else None
 
 
 def _first_present(event: Dict[str, Any], keys: Iterable[str]) -> Any:
@@ -651,7 +660,9 @@ class TeamarrPreflightService:
         Avoids ``get_status``: no recent-event merging, filter options, config
         or queue snapshot. ``active_checks`` are the direct-thread checks only;
         queued ones are reported by the stream checker's own accessor.
-        ``next_check`` is the earliest scheduled automatic check, or ``None``.
+        ``upcoming_checks`` are the earliest scheduled automatic checks (one per
+        event or team, its next one), soonest first and capped at
+        ``UPCOMING_MAX``; ``next_check`` is the first of them, or ``None``.
         """
         with self._lock:
             enabled = bool(self._config.get("enabled"))
@@ -667,25 +678,38 @@ class TeamarrPreflightService:
                 }
                 for check in self._active_checks.values()
             ]
-            next_check = None
+            scheduled: List[tuple] = []
             if enabled and running:
+                # Stamps are computed at scan time and can be a full poll
+                # interval old. One the widget would drop as overdue must not
+                # take a slot from a later real check.
+                oldest_reported = time.time() - NEXT_CHECK_TOLERANCE_SECONDS
                 for item in self._preflight_items:
                     if item.get("state") not in {"scheduled", "already_attempted"}:
                         continue
                     stamp = (item.get("next_automatic_check") or {}).get("timestamp")
-                    if not stamp or (next_check is not None and stamp >= next_check["at"]):
+                    if not stamp:
                         continue
-                    next_check = {
-                        "type": "preflight",
-                        "name": item.get("event_name") or item.get("team_name"),
-                        "channel": item.get("channel_name"),
-                        "at": stamp,
-                    }
+                    stamp_epoch = _timestamp_epoch(stamp)
+                    if stamp_epoch is None or stamp_epoch < oldest_reported:
+                        continue
+                    scheduled.append((
+                        stamp_epoch,
+                        {
+                            "type": "preflight",
+                            "name": item.get("event_name") or item.get("team_name"),
+                            "channel": item.get("channel_name"),
+                            "at": stamp,
+                        },
+                    ))
+        scheduled.sort(key=lambda pair: pair[0])
+        upcoming_checks = [check for _, check in scheduled[:UPCOMING_MAX]]
         return {
             "enabled": enabled,
             "running": running,
             "active_checks": active_checks,
-            "next_check": next_check,
+            "next_check": upcoming_checks[0] if upcoming_checks else None,
+            "upcoming_checks": upcoming_checks,
         }
 
     def get_status(self) -> Dict[str, Any]:
@@ -2123,6 +2147,16 @@ class TeamarrPreflightService:
             return None
 
         seconds = int(event.get("seconds_to_start") or 0)
+        # A post-start offset later than the grace window never runs (the event
+        # is "past" by then), so it is not an upcoming check either.
+        grace_seconds = int(config["post_start_grace_minutes"]) * 60
+        post_offsets = sorted(
+            {
+                int(offset)
+                for offset in list(config.get("post_start_offsets_minutes") or [])
+                if 0 < int(offset) * 60 <= grace_seconds
+            }
+        )
         if seconds >= 0:
             preflight_offset = int(config["preflight_offset_minutes"])
             retry_offsets = [
@@ -2132,23 +2166,19 @@ class TeamarrPreflightService:
             ]
             offsets = sorted({preflight_offset, *retry_offsets}, reverse=True)
             next_offset = next((offset for offset in offsets if seconds > offset * 60), None)
-            if next_offset is None:
-                return None
-            check_at = event_at.timestamp() - next_offset * 60
-            return {
-                "label": "Next auto check",
-                "bucket": f"-{next_offset}m",
-                "timestamp": datetime.fromtimestamp(check_at, tz=timezone.utc).isoformat(),
-            }
+            if next_offset is not None:
+                check_at = event_at.timestamp() - next_offset * 60
+                return {
+                    "label": "Next auto check",
+                    "bucket": f"-{next_offset}m",
+                    "timestamp": datetime.fromtimestamp(check_at, tz=timezone.utc).isoformat(),
+                }
+            # Every pre-start checkpoint has passed. The next check is the
+            # first post-start one, even though the event has not started yet.
+            elapsed_seconds = 0
+        else:
+            elapsed_seconds = abs(seconds)
 
-        elapsed_seconds = abs(seconds)
-        post_offsets = sorted(
-            {
-                int(offset)
-                for offset in list(config.get("post_start_offsets_minutes") or [])
-                if int(offset) > 0
-            }
-        )
         next_offset = next((offset for offset in post_offsets if elapsed_seconds < offset * 60), None)
         if next_offset is None:
             return None

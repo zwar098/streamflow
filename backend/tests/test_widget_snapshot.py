@@ -21,7 +21,7 @@ ALL_KEYS = {
     "last_check_type", "last_check_name", "last_check_channel", "last_check_at",
     "last_check_epoch", "last_check_result", "last_check_duration_seconds",
     "next_check_type", "next_check_name", "next_check_channel", "next_check_at",
-    "next_check_epoch",
+    "next_check_epoch", "upcoming",
 }
 
 
@@ -100,7 +100,9 @@ class TestIdle:
         assert snapshot["active"] is False
         assert snapshot["active_count"] == 0
         assert snapshot["queued"] is False
-        for key in ALL_KEYS - {"schema", "generated_at", "generated_epoch", "active", "active_count", "queued"}:
+        assert snapshot["upcoming"] == []
+        for key in ALL_KEYS - {"schema", "generated_at", "generated_epoch", "active", "active_count", "queued",
+                               "upcoming"}:
             assert snapshot[key] is None, key
         assert snapshot["generated_epoch"] == int(NOW.timestamp())
 
@@ -315,6 +317,99 @@ class TestNextCheck:
         assert snapshot["next_check_type"] is None
 
 
+class TestUpcoming:
+    @staticmethod
+    def cand(kind, minutes, name=None, channel=None):
+        return {"type": kind, "name": name or f"{kind}-{minutes}", "channel": channel,
+                "at": NOW + timedelta(minutes=minutes)}
+
+    def test_no_candidates_gives_an_empty_list_with_the_key_present(self):
+        snapshot = build(next_candidates=[])
+
+        assert snapshot["upcoming"] == []
+
+    def test_the_three_earliest_win_in_order_whatever_the_input_order(self):
+        snapshot = build(next_candidates=[
+            self.cand("automation", 50), self.cand("preflight", 5), self.cand("scheduled_event", 30),
+            self.cand("automation", 10), self.cand("preflight", 40),
+        ])
+
+        assert [(i["type"], i["name"]) for i in snapshot["upcoming"]] == [
+            ("preflight", "preflight-5"), ("automation", "automation-10"), ("scheduled_event", "scheduled_event-30"),
+        ]
+
+    def test_fewer_than_three_candidates_gives_a_shorter_list(self):
+        assert len(build(next_candidates=[self.cand("automation", 5), self.cand("preflight", 6)])["upcoming"]) == 2
+
+    def test_equal_times_order_automation_then_preflight_then_scheduled_event(self):
+        snapshot = build(next_candidates=[
+            self.cand("scheduled_event", 5), self.cand("preflight", 5), self.cand("automation", 5),
+        ])
+
+        assert [i["type"] for i in snapshot["upcoming"]] == ["automation", "preflight", "scheduled_event"]
+
+    def test_overdue_candidates_are_dropped_but_just_late_ones_stay(self):
+        late = self.cand("automation", 0, name="just late")
+        late["at"] = NOW - timedelta(seconds=30)
+        old = self.cand("preflight", 0, name="too old")
+        old["at"] = NOW - timedelta(seconds=300)
+
+        snapshot = build(next_candidates=[old, late])
+
+        assert [i["name"] for i in snapshot["upcoming"]] == ["just late"]
+
+    def test_exact_duplicates_appear_once(self):
+        snapshot = build(next_candidates=[
+            self.cand("automation", 5, name="Hourly"), self.cand("automation", 5, name="Hourly"),
+            self.cand("automation", 65, name="Hourly"),
+        ])
+
+        assert [i["epoch"] for i in snapshot["upcoming"]] == [
+            int((NOW + timedelta(minutes=5)).timestamp()), int((NOW + timedelta(minutes=65)).timestamp()),
+        ]
+
+    def test_same_name_at_different_times_fills_several_slots(self):
+        snapshot = build(next_candidates=[self.cand("automation", m, name="Hourly") for m in (5, 65, 125, 185)])
+
+        assert [i["name"] for i in snapshot["upcoming"]] == ["Hourly"] * 3
+
+    def test_first_item_is_the_next_check(self):
+        snapshot = build(next_candidates=[
+            self.cand("scheduled_event", 5, channel="Goal Rush"), self.cand("preflight", 5, channel="NHL"),
+            self.cand("automation", 9),
+        ])
+
+        first = snapshot["upcoming"][0]
+        assert (first["type"], first["name"], first["channel"], first["at"], first["epoch"]) == (
+            snapshot["next_check_type"], snapshot["next_check_name"], snapshot["next_check_channel"],
+            snapshot["next_check_at"], snapshot["next_check_epoch"],
+        )
+
+    def test_items_have_exactly_the_documented_keys_and_formats(self):
+        item = build(next_candidates=[self.cand("preflight", 5, channel="NHL | X")])["upcoming"][0]
+
+        assert set(item) == {"type", "name", "channel", "at", "epoch"}
+        parsed = datetime.fromisoformat(item["at"])
+        assert parsed.utcoffset() is not None
+        assert int(parsed.timestamp()) == item["epoch"]
+
+    def test_names_are_truncated_like_the_other_fields(self):
+        item = build(next_candidates=[self.cand("preflight", 5, name="x" * 300, channel="y" * 300)])["upcoming"][0]
+
+        assert len(item["name"]) <= MAX_TEXT_LENGTH and item["name"].endswith("…")
+        assert len(item["channel"]) <= MAX_TEXT_LENGTH
+
+    def test_invalid_candidates_are_skipped(self):
+        snapshot = build(next_candidates=[
+            {"type": "manual", "name": "x", "channel": None, "at": NOW + timedelta(minutes=1)},
+            {"type": "preflight", "name": "x", "channel": None, "at": "garbage"},
+            "not a dict",
+            self.cand("automation", 9),
+        ])
+
+        assert [i["type"] for i in snapshot["upcoming"]] == ["automation"]
+
+
 class TestLastCheck:
     def test_passes_through_the_register_record(self):
         finished = NOW - timedelta(minutes=2)
@@ -382,7 +477,8 @@ class TestSize:
                               "at": NOW + timedelta(hours=1)}],
         )
 
-        assert len(json.dumps(snapshot, ensure_ascii=False).encode("utf-8")) < 2048
+        # Three upcoming items carry two names each, so the cap is 3 KB.
+        assert len(json.dumps(snapshot, ensure_ascii=False).encode("utf-8")) < 3072
         for key in ("name", "stage", "last_check_name", "last_check_channel", "next_check_name", "next_check_channel"):
             assert len(snapshot[key]) <= MAX_TEXT_LENGTH
         assert snapshot["name"].endswith("…")

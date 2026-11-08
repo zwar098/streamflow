@@ -18,7 +18,9 @@ slot or a direct thread, each with ``source``, ``scheduled_event_id``,
 ``stale_after_seconds``.
 
 ``last_check``: the newest register record or ``None``.
-``next_candidates``: ``[{"type", "name", "channel", "at"}]``.
+``next_candidates``: ``[{"type", "name", "channel", "at"}]``, any number, in any
+order. The earliest becomes the ``next_check_*`` fields and the earliest
+``UPCOMING_MAX`` fill ``upcoming``.
 """
 
 from __future__ import annotations
@@ -29,6 +31,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 SCHEMA_VERSION = 1
 MAX_TEXT_LENGTH = 80
 NEXT_CHECK_TOLERANCE_SECONDS = 90
+UPCOMING_MAX = 3
 
 # Same order as AutomatedStreamManager.RUN_STAGES.
 RUN_STAGE_ORDER: Tuple[str, ...] = (
@@ -334,6 +337,40 @@ def _next_check_block(candidates: Iterable[Dict[str, Any]], now: datetime) -> Di
     return block
 
 
+def _upcoming_block(candidates: Iterable[Dict[str, Any]], now: datetime) -> Dict[str, Any]:
+    """The next ``UPCOMING_MAX`` checks, soonest first (``upcoming[0]`` is ``next_check``)."""
+    ranked: List[Tuple[Tuple[float, int], Dict[str, Any], datetime]] = []
+    for candidate in candidates or []:
+        if not isinstance(candidate, dict) or candidate.get("type") not in TYPE_PRIORITY:
+            continue
+        at = to_local_aware(candidate.get("at"))
+        if at is None or (now - at).total_seconds() > NEXT_CHECK_TOLERANCE_SECONDS:
+            continue
+        ranked.append(((at.timestamp(), TYPE_PRIORITY[candidate["type"]]), candidate, at))
+    # Stable: equal keys keep their input order, as _next_check_block does.
+    ranked.sort(key=lambda entry: entry[0])
+
+    items: List[Dict[str, Any]] = []
+    seen = set()
+    for _, candidate, at in ranked:
+        item = {
+            "type": candidate["type"],
+            "name": _text(candidate.get("name")),
+            "channel": _text(candidate.get("channel")),
+            "at": _iso(at),
+            "epoch": _epoch(at),
+        }
+        # A cache refresh racing a scheduler update could list one run twice.
+        identity = (item["type"], item["name"], item["channel"], item["epoch"])
+        if identity in seen:
+            continue
+        seen.add(identity)
+        items.append(item)
+        if len(items) >= UPCOMING_MAX:
+            break
+    return {"upcoming": items}
+
+
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
@@ -367,5 +404,7 @@ def build_widget_snapshot(
     )
     snapshot["queued"] = bool(isinstance(automation, dict) and automation.get("state") == "queued")
     snapshot.update(_last_check_block(last_check))
+    next_candidates = list(next_candidates or [])
     snapshot.update(_next_check_block(next_candidates, now))
+    snapshot.update(_upcoming_block(next_candidates, now))
     return snapshot

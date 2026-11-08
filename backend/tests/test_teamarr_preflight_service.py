@@ -1288,6 +1288,64 @@ class TeamarrPreflightServiceTest(unittest.TestCase):
             "timestamp": "2026-05-28T22:25:00+00:00",
         })
 
+    def next_check_for(self, seconds_to_start, state="already_attempted", **config_overrides):
+        config = {
+            "preflight_offset_minutes": 20,
+            "retry_offsets_minutes": [10, 3],
+            "post_start_offsets_minutes": [2, 4],
+            "post_start_grace_minutes": 5,
+            **config_overrides,
+        }
+        event_at = FIXED_NOW + seconds_to_start
+        event = {
+            "event_date": time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(event_at)),
+            "seconds_to_start": seconds_to_start,
+        }
+        return TeamarrPreflightService._next_automatic_check(event, config, state, None)
+
+    def test_first_post_start_check_is_upcoming_once_every_pre_start_check_has_passed(self):
+        # The -3m check was attempted; the next one is +2m, not "nothing".
+        for seconds in (170, 120, 30, 0):
+            with self.subTest(seconds_to_start=seconds):
+                check = self.next_check_for(seconds)
+                self.assertEqual(check["bucket"], "+2m")
+                self.assertEqual(check["label"], "Next auto check")
+                self.assertEqual(check["timestamp"][:19], time.strftime(
+                    "%Y-%m-%dT%H:%M:%S", time.gmtime(FIXED_NOW + seconds + 120)))
+
+    def test_pre_start_checks_still_come_before_the_post_start_ones(self):
+        self.assertEqual(self.next_check_for(300)["bucket"], "-3m")
+        self.assertEqual(self.next_check_for(900)["bucket"], "-10m")
+
+    def test_post_start_checks_follow_each_other_then_stop(self):
+        self.assertEqual(self.next_check_for(-30, "scheduled")["bucket"], "+2m")
+        self.assertEqual(self.next_check_for(-180)["bucket"], "+4m")
+        self.assertIsNone(self.next_check_for(-300))
+
+    def test_post_start_offsets_beyond_the_grace_window_are_never_upcoming(self):
+        # An event is "past" once the grace window ends, so +8m can never run.
+        self.assertIsNone(self.next_check_for(30, post_start_offsets_minutes=[8]))
+        self.assertEqual(self.next_check_for(30, post_start_offsets_minutes=[2, 8])["bucket"], "+2m")
+        self.assertIsNone(self.next_check_for(-130, post_start_offsets_minutes=[2, 8]))
+
+    def test_no_post_start_offsets_means_no_check_after_the_last_pre_start_one(self):
+        self.assertIsNone(self.next_check_for(30, post_start_offsets_minutes=[]))
+
+    def test_post_start_check_is_exposed_after_the_last_pre_start_check_ran(self):
+        checker = FakeChecker()
+        service, _, _ = self.make_service(
+            [make_event(event_date="2026-05-28T22:01:30+00:00")],
+            checker=checker,
+        )
+
+        self.assertEqual(service.run_once(force=True)["launched"], 1)
+        service.run_once(force=True)
+
+        item = service.get_status()["upcoming_events"][0]
+        self.assertEqual(item["state"], "already_attempted")
+        self.assertEqual(item["next_automatic_check"]["bucket"], "+2m")
+        self.assertEqual(item["next_automatic_check"]["timestamp"], "2026-05-28T22:03:30+00:00")
+
     def test_due_bucket_catches_up_after_crossing_poll_window(self):
         checker = FakeChecker()
         service, _, _ = self.make_service(
@@ -1745,8 +1803,10 @@ class TeamarrPreflightServiceTest(unittest.TestCase):
         result = service.run_once(force=True)
         self.assertTrue(result["success"])
 
+        # Wait for the release itself. Counting gate calls is not enough: the
+        # automation and direct gates are both raised before the check ends.
         deadline = time.time() + 2
-        while time.time() < deadline and len(checker.gates) < 2:
+        while time.time() < deadline and checker.gates[-1:] != [("teamarr_preflight_direct", False)]:
             time.sleep(0.01)
 
         self.assertIn(("teamarr_preflight_direct", True), checker.gates)

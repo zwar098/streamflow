@@ -233,6 +233,107 @@ class TestNextCheck:
         assert client.get("/api/v1/stats/widget").get_json()["next_check_name"] == "Show"
 
 
+def iso_in(minutes):
+    return (NOW + timedelta(minutes=minutes)).isoformat()
+
+
+def naive_in(minutes):
+    return (NOW + timedelta(minutes=minutes)).replace(tzinfo=None).isoformat()
+
+
+class TestUpcoming:
+    def test_four_future_automation_events_give_three_items(self, client, services):
+        services.events_scheduler.get_cached_events_snapshot.return_value = {
+            "events": [{"time": naive_in(m), "period_name": "Hourly Automation"} for m in (5, 65, 125, 185)],
+            "stale": False,
+        }
+
+        body = client.get("/api/v1/stats/widget").get_json()
+
+        assert [i["type"] for i in body["upcoming"]] == ["automation"] * 3
+        assert [i["epoch"] for i in body["upcoming"]] == [
+            int((NOW + timedelta(minutes=m)).timestamp()) for m in (5, 65, 125)
+        ]
+        assert body["upcoming"][0]["epoch"] == body["next_check_epoch"]
+
+    def test_monitoring_scheduled_events_are_left_out_of_the_list(self, client, services):
+        services.scheduling.get_scheduled_events.return_value = [
+            {"schedule_type": "check", "check_time": iso_in(10), "program_title": "Show", "channel_name": "Goal Rush"},
+            {"schedule_type": "monitoring", "check_time": iso_in(4), "program_title": "Monitor me", "channel_name": "X"},
+        ]
+        services.events_scheduler.get_cached_events_snapshot.return_value = {
+            "events": [{"time": naive_in(20), "period_name": "Hourly"}], "stale": False,
+        }
+
+        body = client.get("/api/v1/stats/widget").get_json()
+
+        assert [(i["type"], i["name"]) for i in body["upcoming"]] == [
+            ("scheduled_event", "Show"), ("automation", "Hourly"),
+        ]
+
+    def test_preflight_list_is_merged_with_the_other_sources_in_time_order(self, client, services):
+        services.events_scheduler.get_cached_events_snapshot.return_value = {
+            "events": [{"time": naive_in(30), "period_name": "Hourly"}], "stale": False,
+        }
+        services.preflight.get_widget_snapshot.return_value = {
+            "enabled": True, "running": True, "active_checks": [],
+            "next_check": {"type": "preflight", "name": "A", "channel": "NHL | A", "at": iso_in(5)},
+            "upcoming_checks": [
+                {"type": "preflight", "name": "A", "channel": "NHL | A", "at": iso_in(5)},
+                {"type": "preflight", "name": "B", "channel": "NHL | B", "at": iso_in(45)},
+            ],
+        }
+
+        body = client.get("/api/v1/stats/widget").get_json()
+
+        assert [(i["type"], i["name"]) for i in body["upcoming"]] == [
+            ("preflight", "A"), ("automation", "Hourly"), ("preflight", "B"),
+        ]
+
+    def test_a_preflight_snapshot_with_only_next_check_still_contributes(self, client, services):
+        services.preflight.get_widget_snapshot.return_value = {
+            "enabled": True, "running": True, "active_checks": [],
+            "next_check": {"type": "preflight", "name": "A", "channel": "NHL | A", "at": iso_in(5)},
+        }
+
+        body = client.get("/api/v1/stats/widget").get_json()
+
+        assert [i["name"] for i in body["upcoming"]] == ["A"]
+
+    def test_one_failing_source_still_lets_the_others_fill_the_list(self, client, services):
+        services.config.get_global_settings.side_effect = RuntimeError("db down")
+        services.scheduling.get_scheduled_events.return_value = [
+            {"schedule_type": "check", "check_time": iso_in(m), "program_title": f"Show {m}", "channel_name": "C"}
+            for m in (10, 20)
+        ]
+
+        body = client.get("/api/v1/stats/widget").get_json()
+
+        assert [i["name"] for i in body["upcoming"]] == ["Show 10", "Show 20"]
+
+    def test_nothing_scheduled_gives_an_empty_list(self, client, services):
+        assert client.get("/api/v1/stats/widget").get_json()["upcoming"] == []
+
+    def test_the_candidate_cache_still_holds_with_the_longer_lists(self, client, services):
+        services.events_scheduler.get_cached_events_snapshot.return_value = {
+            "events": [{"time": naive_in(m), "period_name": "Hourly"} for m in (5, 65, 125)], "stale": False,
+        }
+
+        for _ in range(3):
+            client.get("/api/v1/stats/widget")
+
+        assert services.config.get_global_settings.call_count == 1
+        assert services.scheduling.get_scheduled_events.call_count == 1
+
+    def test_response_stays_small_with_a_full_list(self, client, services):
+        services.events_scheduler.get_cached_events_snapshot.return_value = {
+            "events": [{"time": naive_in(m), "period_name": "Evening Automation"} for m in (5, 65, 125)],
+            "stale": False,
+        }
+
+        assert len(client.get("/api/v1/stats/widget").data) < 2048
+
+
 def test_rate_limiting_applies_normally(client, services, monkeypatch):
     monkeypatch.setattr(web_api, "API_RATE_LIMIT_ENABLED", True)
     monkeypatch.setattr(

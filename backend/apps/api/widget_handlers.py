@@ -20,6 +20,7 @@ from apps.core.api_responses import error_response
 from apps.core.logging_config import setup_logging
 from apps.orchestration.widget_snapshot import (
     NEXT_CHECK_TOLERANCE_SECONDS,
+    UPCOMING_MAX,
     build_widget_snapshot,
     to_local_aware,
 )
@@ -50,23 +51,26 @@ def _safe(name: str, getter: Callable[[], Any]) -> Any:
         return None
 
 
-def _first_upcoming(items: List[Dict[str, Any]], time_key: str, now: datetime) -> Optional[Dict[str, Any]]:
-    """Return the first item at or after ``now - tolerance``, in list order."""
+def _upcoming(items: List[Dict[str, Any]], time_key: str, now: datetime, limit: int) -> List[Dict[str, Any]]:
+    """Return the first ``limit`` items at or after ``now - tolerance``, in list order."""
+    found: List[Dict[str, Any]] = []
     for item in items:
         at = to_local_aware(item.get(time_key))
         if at is not None and (now - at).total_seconds() <= NEXT_CHECK_TOLERANCE_SECONDS:
-            return item
-    return None
+            found.append(item)
+            if len(found) >= limit:
+                break
+    return found
 
 
-def _automation_candidate(
+def _automation_candidates(
     get_automation_config_manager: Callable[[], Any],
     get_events_scheduler: Callable[[], Any],
     now: datetime,
-) -> Optional[Dict[str, Any]]:
+) -> List[Dict[str, Any]]:
     settings = get_automation_config_manager().get_global_settings() or {}
     if not settings.get("regular_automation_enabled"):
-        return None
+        return []
     scheduler = get_events_scheduler()
     snapshot = scheduler.get_cached_events_snapshot(LOOKAHEAD_HOURS, LOOKAHEAD_MAX_EVENTS) or {}
     events = snapshot.get("events") or []
@@ -78,29 +82,29 @@ def _automation_candidate(
         (e for e in events if isinstance(e, dict)),
         key=lambda e: (to_local_aware(e.get("time")) or now).timestamp(),
     )
-    event = _first_upcoming(events, "time", now)
-    if not event:
-        return None
-    return {"type": "automation", "name": event.get("period_name"), "channel": None, "at": event.get("time")}
+    return [
+        {"type": "automation", "name": event.get("period_name"), "channel": None, "at": event.get("time")}
+        for event in _upcoming(events, "time", now, UPCOMING_MAX)
+    ]
 
 
-def _scheduled_event_candidate(
+def _scheduled_event_candidates(
     get_scheduling_service: Callable[[], Any],
     now: datetime,
-) -> Optional[Dict[str, Any]]:
+) -> List[Dict[str, Any]]:
     events = [
         e for e in get_scheduling_service().get_scheduled_events()
         if isinstance(e, dict) and e.get("schedule_type", "check") == "check"
     ]
-    event = _first_upcoming(events, "check_time", now)
-    if not event:
-        return None
-    return {
-        "type": "scheduled_event",
-        "name": event.get("program_title"),
-        "channel": event.get("channel_name"),
-        "at": event.get("check_time"),
-    }
+    return [
+        {
+            "type": "scheduled_event",
+            "name": event.get("program_title"),
+            "channel": event.get("channel_name"),
+            "at": event.get("check_time"),
+        }
+        for event in _upcoming(events, "check_time", now, UPCOMING_MAX)
+    ]
 
 
 def _cached_next_candidates(
@@ -116,18 +120,20 @@ def _cached_next_candidates(
             return list(_next_cache["candidates"])
 
     candidates: List[Dict[str, Any]] = []
-    automation = _safe(
-        "next automation period",
-        lambda: _automation_candidate(get_automation_config_manager, get_events_scheduler, now),
+    candidates.extend(
+        _safe(
+            "next automation periods",
+            lambda: _automation_candidates(get_automation_config_manager, get_events_scheduler, now),
+        )
+        or []
     )
-    if automation:
-        candidates.append(automation)
-    scheduled = _safe(
-        "next scheduled event",
-        lambda: _scheduled_event_candidate(get_scheduling_service, now),
+    candidates.extend(
+        _safe(
+            "next scheduled events",
+            lambda: _scheduled_event_candidates(get_scheduling_service, now),
+        )
+        or []
     )
-    if scheduled:
-        candidates.append(scheduled)
 
     with _next_cache_lock:
         _next_cache["at"] = time.monotonic()
@@ -166,8 +172,10 @@ def get_widget_stats_response(
             get_scheduling_service=get_scheduling_service,
             now=now,
         )
-        if preflight.get("next_check"):
-            candidates = candidates + [preflight["next_check"]]
+        preflight_upcoming = preflight.get("upcoming_checks")
+        if preflight_upcoming is None and preflight.get("next_check"):
+            preflight_upcoming = [preflight["next_check"]]
+        candidates = candidates + list(preflight_upcoming or [])
 
         snapshot = build_widget_snapshot(
             automation=automation,

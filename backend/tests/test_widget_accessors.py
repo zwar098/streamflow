@@ -144,6 +144,63 @@ class TestPreflightSnapshot:
 
         assert service.get_widget_snapshot()["next_check"]["name"] == "Retry"
 
+    def test_overdue_stamp_does_not_shadow_a_later_real_check(self):
+        # Stamps are computed at scan time and can be a poll interval old. One
+        # the widget would drop as overdue must not hide the next real check.
+        stale = item("Stale", -10)
+        service = make_preflight([stale, item("Real", 4)])
+
+        assert service.get_widget_snapshot()["next_check"]["name"] == "Real"
+
+    def test_slightly_overdue_stamp_is_still_reported(self):
+        just_late = item("Just late", 0)
+        just_late["next_automatic_check"]["timestamp"] = (
+            datetime.now(timezone.utc) - timedelta(seconds=30)
+        ).isoformat()
+
+        assert make_preflight([just_late]).get_widget_snapshot()["next_check"]["name"] == "Just late"
+
+    def test_tolerance_matches_the_widget_builder(self):
+        from apps.orchestration import widget_snapshot
+        from apps.stream import teamarr_preflight_service
+
+        assert (teamarr_preflight_service.NEXT_CHECK_TOLERANCE_SECONDS
+                == widget_snapshot.NEXT_CHECK_TOLERANCE_SECONDS)
+
+    def test_upcoming_checks_are_sorted_and_capped_at_three(self):
+        items = [item("E", 50), item("B", 10), item("D", 40), item("A", 5), item("C", 20)]
+
+        snapshot = make_preflight(items).get_widget_snapshot()
+
+        assert [c["name"] for c in snapshot["upcoming_checks"]] == ["A", "B", "C"]
+        assert snapshot["next_check"] == snapshot["upcoming_checks"][0]
+
+    def test_upcoming_checks_skip_states_that_are_not_scheduled(self):
+        due = {"event_name": "Due", "state": "due", "next_automatic_check": {"label": "Due now", "timestamp": None}}
+        items = [due, item("Done", 1, state="completed"), item("Past", 2, state="past"), item("Real", 9)]
+
+        snapshot = make_preflight(items).get_widget_snapshot()
+
+        assert [c["name"] for c in snapshot["upcoming_checks"]] == ["Real"]
+
+    def test_upcoming_checks_are_empty_when_disabled_or_stopped(self):
+        for kwargs in ({"enabled": False}, {"running": False}):
+            snapshot = make_preflight([item("x", 5)], **kwargs).get_widget_snapshot()
+            assert snapshot["upcoming_checks"] == [] and snapshot["next_check"] is None
+
+    def test_overdue_checks_do_not_take_an_upcoming_slot(self):
+        items = [item("Stale 1", -10), item("Stale 2", -20), item("Real", 3)]
+
+        snapshot = make_preflight(items).get_widget_snapshot()
+
+        assert [c["name"] for c in snapshot["upcoming_checks"]] == ["Real"]
+
+    def test_list_length_matches_the_widget_builder(self):
+        from apps.orchestration import widget_snapshot
+        from apps.stream import teamarr_preflight_service
+
+        assert teamarr_preflight_service.UPCOMING_MAX == widget_snapshot.UPCOMING_MAX
+
     def test_static_team_items_fall_back_to_the_team_name(self):
         team = item(None, 5)
         team["team_name"] = "Chicago Blackhawks"
