@@ -645,6 +645,49 @@ class TeamarrPreflightService:
                 self._scan_status["completed_at"] = self.clock()
         return not still_running
 
+    def get_widget_snapshot(self) -> Dict[str, Any]:
+        """Small, read-only view for the widget endpoint.
+
+        Avoids ``get_status``: no recent-event merging, filter options, config
+        or queue snapshot. ``active_checks`` are the direct-thread checks only;
+        queued ones are reported by the stream checker's own accessor.
+        ``next_check`` is the earliest scheduled automatic check, or ``None``.
+        """
+        with self._lock:
+            enabled = bool(self._config.get("enabled"))
+            running = bool(self._thread and self._thread.is_alive())
+            active_checks = [
+                {
+                    "source": "teamarr_preflight",
+                    "channel_id": check.get("dispatcharr_channel_id"),
+                    "event_name": check.get("event_name"),
+                    "team_name": check.get("team_name"),
+                    "channel_name": check.get("channel_name"),
+                    "started_at": check.get("started_at"),
+                }
+                for check in self._active_checks.values()
+            ]
+            next_check = None
+            if enabled and running:
+                for item in self._preflight_items:
+                    if item.get("state") not in {"scheduled", "already_attempted"}:
+                        continue
+                    stamp = (item.get("next_automatic_check") or {}).get("timestamp")
+                    if not stamp or (next_check is not None and stamp >= next_check["at"]):
+                        continue
+                    next_check = {
+                        "type": "preflight",
+                        "name": item.get("event_name") or item.get("team_name"),
+                        "channel": item.get("channel_name"),
+                        "at": stamp,
+                    }
+        return {
+            "enabled": enabled,
+            "running": running,
+            "active_checks": active_checks,
+            "next_check": next_check,
+        }
+
     def get_status(self) -> Dict[str, Any]:
         queue_snapshot = self._teamarr_queue_snapshot()
         with self._lock:
@@ -2497,6 +2540,7 @@ class TeamarrPreflightService:
             event,
             {
                 "bucket": metadata.get("trigger_bucket"),
+                "duration_seconds": self._seconds_since(metadata.get("started_epoch")),
                 "error": "Preflight check failed" if result.get("error") else None,
                 "reason": result.get("reason"),
                 "stats": self._public_check_stats(result.get("stats")),
@@ -2521,6 +2565,7 @@ class TeamarrPreflightService:
             logger.warning("Could not trigger Teamarr order-now after probe: %s", exc)
 
     def _run_check(self, key: str, event: Dict[str, Any], config: Dict[str, Any]) -> None:
+        check_started_at = self.clock()
         try:
             current_config = self.get_config(include_secret=True)
             deadline = preflight_deadline(event, config)
@@ -2572,6 +2617,7 @@ class TeamarrPreflightService:
                 event,
                 {
                     "bucket": event.get("trigger_bucket"),
+                    "duration_seconds": self._seconds_since(check_started_at),
                     "error": "Preflight check failed" if result.get("error") else None,
                     "reason": result.get("reason"),
                     "stats": self._public_check_stats(result.get("stats")),
@@ -2587,6 +2633,7 @@ class TeamarrPreflightService:
             self._record_event("preflight_failed", event, {
                 "error": "Teamarr preflight check failed",
                 "bucket": event.get("trigger_bucket"),
+                "duration_seconds": self._seconds_since(check_started_at),
             })
         finally:
             self._finish_active_check(key)
@@ -2865,6 +2912,30 @@ class TeamarrPreflightService:
             payload.get("dispatcharr_channel_id"),
             payload.get("identity"),
         )
+        if event_type in {"preflight_completed", "preflight_failed"}:
+            self._register_finished_check(event_type, event, details)
+
+    def _seconds_since(self, started: Any) -> Optional[float]:
+        try:
+            return max(0.0, self.clock() - float(started))
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _register_finished_check(event_type: str, event: Dict[str, Any], details: Dict[str, Any]) -> None:
+        """Tell the last-check register that a real preflight check finished."""
+        try:
+            from apps.telemetry import last_check_register
+
+            last_check_register.record(
+                check_type="preflight",
+                name=event.get("event_name") or event.get("team_name"),
+                channel=event.get("channel_name"),
+                result="completed" if event_type == "preflight_completed" else "failed",
+                duration_seconds=details.get("duration_seconds"),
+            )
+        except Exception as exc:
+            logger.debug("Could not record finished preflight check: %s", exc)
 
     @staticmethod
     def _controlled_deferral_reason(result: Any) -> Optional[str]:

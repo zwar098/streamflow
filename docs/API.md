@@ -242,3 +242,47 @@ all active viewer channels, and exclusions always take precedence.
 Provider telemetry uses `availability_percentage`. The misspelled V7 field
 `availability_pecentage` remains temporarily available with the same value for
 compatibility.
+
+---
+
+## Widget
+
+| Method | Path | Description |
+| ------ | ---- | ----------- |
+| GET | `/api/v1/stats/widget` | Flat status document for desktop widgets |
+| GET | `/api/stats/widget` | Unversioned alias |
+
+A small (about 1 KB), cheap, read-only document that answers three questions:
+is a real check running, what was the last one to finish, and what is the next
+one scheduled. It is built from in-memory state only, so it is safe to poll every
+couple of seconds. Responses carry `Cache-Control: no-store` and the normal API
+rate limit applies.
+
+"Check" means exactly three things: an `automation` period run, a
+`scheduled_event` (a Scheduling-page check), and a Teamarr `preflight`. Manual
+single-channel checks, Shadow Monitor, monitoring sessions, and UDI/EPG refreshes
+never appear. A scheduler tick that finds nothing due is not a check either.
+
+Every key is always present, with `null` when it does not apply. Each timestamp
+is ISO 8601 with the server's UTC offset and has an integer `*_epoch` twin.
+Compute "4m ago" as `generated_epoch - last_check_epoch` so clock skew between
+the client and the server does not matter.
+
+| Field | Meaning |
+| ----- | ------- |
+| `schema` | Payload version, currently `1`. Additive fields do not bump it. |
+| `active`, `active_count` | A real check is running; how many are (parallel preflights can overlap). |
+| `type` | `automation`, `scheduled_event`, or `preflight` for the primary active check. |
+| `name`, `channel_name` | Title and subtitle. `channel_name` is `null` for automation. |
+| `stage`, `step`, `steps` | Human stage label. `step`/`steps` (for example 3 of 8) are automation only. |
+| `current`, `total`, `percent` | Progress within the stage, or `null` when unknown or stale. |
+| `started_at`, `started_epoch` | When the primary check started. |
+| `queued` | An automation run is waiting behind the Stream Checker. Never sets `active`. |
+| `last_check_*` | Type, name, channel, finish time, `result` (`completed`, `completed_degraded`, `failed`, `aborted`) and duration of the newest finished check. |
+| `next_check_*` | Type, name, channel and start time of the earliest upcoming check in the next 24 hours. |
+
+When several checks run at once the primary is chosen by type (automation, then
+preflight, then scheduled event), then by earliest start. `last_check_*` is held
+in memory and seeded once from retained run history, so right after a restart it
+may not reflect failures that left no run record. The next check is cached for
+15 seconds.

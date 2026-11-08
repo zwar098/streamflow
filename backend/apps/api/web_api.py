@@ -81,6 +81,7 @@ from apps.api.regex_handlers import (
     update_regex_global_settings_response,
     upsert_group_regex_config_response,
 )
+from apps.api.widget_handlers import get_widget_stats_response
 from apps.api.stream_limit_handlers import (
     bulk_set_channel_stream_limits_response,
     delete_channel_stream_limit_response,
@@ -2153,6 +2154,20 @@ def get_automation_status():
     """Get the status of the automation background service."""
     return get_automation_status_response(
         get_automation_manager=get_automation_manager,
+        get_automation_config_manager=get_automation_config_manager,
+    )
+
+
+@app.route('/api/v1/stats/widget', methods=['GET'])
+@app.route('/api/stats/widget', methods=['GET'])
+def get_widget_stats():
+    """Small flat JSON document for desktop widgets (Rainmeter and similar)."""
+    return get_widget_stats_response(
+        get_automation_manager=get_automation_manager,
+        get_stream_checker_service=get_stream_checker_service,
+        get_teamarr_preflight_service=get_teamarr_preflight_service,
+        get_scheduling_service=get_scheduling_service,
+        get_events_scheduler=get_events_scheduler,
         get_automation_config_manager=get_automation_config_manager,
     )
 

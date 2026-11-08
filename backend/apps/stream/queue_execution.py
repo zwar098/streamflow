@@ -49,6 +49,7 @@ class StreamCheckQueueExecutionMixin:
             from apps.stream.teamarr_preflight_service import get_teamarr_preflight_service
             result = get_teamarr_preflight_service().validate_queued_check(queue_metadata)
         if result is None:
+            queue_metadata['started_epoch'] = time.time()
             result = self.check_single_channel(
                 channel_id,
                 _operation_already_reserved=True,
@@ -73,6 +74,29 @@ class StreamCheckQueueExecutionMixin:
                     channel_id,
                     exc,
                 )
+        def record_scheduled_event_result() -> None:
+            if queue_metadata.get('scheduled_event_id') is None or not isinstance(result, dict):
+                return
+            if result.get('skipped'):
+                return
+            started = queue_metadata.get('started_epoch')
+            try:
+                from apps.telemetry import last_check_register
+
+                last_check_register.record(
+                    check_type='scheduled_event',
+                    name=queue_metadata.get('program_name'),
+                    channel=result.get('channel_name'),
+                    result='completed' if result.get('success') else 'failed',
+                    duration_seconds=(time.time() - started) if started else None,
+                )
+            except Exception as exc:
+                logger.debug("Could not record finished scheduled-event check: %s", exc)
+
+        def record_check_results() -> None:
+            record_teamarr_result()
+            record_scheduled_event_result()
+
         with self.lock:
             external_abort_unchanged = (
                 int(getattr(self, '_external_abort_generation', 0))
@@ -112,14 +136,14 @@ class StreamCheckQueueExecutionMixin:
             self._fail_channel_check(
                 channel_id,
                 result.get('error') or result.get('reason') or 'single channel check failed',
-                record_teamarr_result,
+                record_check_results,
                 queue_entry_token=queue_entry_token,
                 allow_already_failed_side_effects=True,
             )
         else:
             self._complete_channel_check(
                 channel_id,
-                record_teamarr_result,
+                record_check_results,
                 queue_entry_token=queue_entry_token,
                 allow_already_completed_side_effects=True,
             )

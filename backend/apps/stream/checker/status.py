@@ -5,7 +5,7 @@ import math
 from copy import deepcopy
 from collections import Counter
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from apps.stream.stream_check_utils import _stream_analysis_timeout
 from apps.stream.stale_status_snapshot import external_m3u_account_risk, external_message_class
 from apps.core.operation_timing import STREAM_OPERATION_TIMINGS
@@ -424,6 +424,79 @@ class CheckerStatusMixin:
                 if active:
                     return False
             return self.progress.clear_if_matches(expected_progress)
+
+
+    def get_widget_event_checks(self, extra_channel_ids=()) -> Dict[str, Any]:
+        """Small, read-only view of event checks that own a queue slot.
+
+        Built for the widget endpoint, so it never touches ``completed_entries``
+        or builds the full ``get_status()`` payload. Only preflight and
+        scheduled-event entries are returned; manual single-channel checks and
+        any other queue work are out of scope.
+
+        Checker progress is read only when an owned entry exists (or the caller
+        reports direct-thread checks through ``extra_channel_ids``), because
+        persisted progress is a database read. Progress is returned per channel
+        so the caller can decorate an owned entry; progress alone never makes a
+        check active.
+        """
+        entries: List[Dict[str, Any]] = []
+        with self.check_queue.lock:
+            for channel_id, metadata in list(self.check_queue.in_progress_metadata.items()):
+                if not isinstance(metadata, dict):
+                    continue
+                source = metadata.get('source')
+                scheduled_event_id = metadata.get('scheduled_event_id')
+                if source != 'teamarr_preflight' and scheduled_event_id is None and source != 'auto_create':
+                    continue
+                event = metadata.get('event') if isinstance(metadata.get('event'), dict) else {}
+                entries.append({
+                    'channel_id': channel_id,
+                    'source': source,
+                    'scheduled_event_id': scheduled_event_id,
+                    'program_name': metadata.get('program_name'),
+                    'event_name': event.get('event_name'),
+                    'team_name': event.get('team_name'),
+                    'channel_name': event.get('channel_name'),
+                    'started_at': self.check_queue.channel_start_times.get(channel_id),
+                })
+
+        progress_by_channel: Dict[Any, Dict[str, Any]] = {}
+        if entries or extra_channel_ids:
+            def keep(progress: Any) -> None:
+                if not isinstance(progress, dict) or progress.get('channel_id') is None:
+                    return
+                progress_by_channel[progress['channel_id']] = {
+                    key: progress.get(key)
+                    for key in (
+                        'channel_name', 'step', 'status', 'current_stream',
+                        'total_streams', 'percentage', 'timestamp', 'stale',
+                    )
+                }
+
+            keep(self.progress.get())
+            for item in self._parallel_preflight_progress():
+                keep(item.get('progress'))
+
+            # Scheduled events carry only the program title; fill in the channel.
+            for entry in entries:
+                if entry['channel_name']:
+                    continue
+                known = progress_by_channel.get(entry['channel_id']) or {}
+                name = known.get('channel_name')
+                if not name:
+                    try:
+                        channel = self._checker_get_udi_manager().get_channel_by_id(entry['channel_id'])
+                        name = (channel or {}).get('name')
+                    except Exception:
+                        name = None
+                entry['channel_name'] = name
+
+        return {
+            'entries': entries,
+            'progress_by_channel': progress_by_channel,
+            'stale_after_seconds': self._current_progress_stale_after_seconds(),
+        }
 
 
     def get_status(self) -> Dict:

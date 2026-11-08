@@ -2903,7 +2903,21 @@ class AutomatedStreamManager:
                         else final_state
                     )
             snapshot_to_store = copy.deepcopy(status_data.get("run_snapshot"))
+            finished_check = self._finished_check_record(status_data, final_state)
         self._store_run_snapshot(snapshot_to_store)
+        if finished_check:
+            try:
+                from apps.telemetry import last_check_register
+
+                last_check_register.record(
+                    check_type="automation",
+                    name=finished_check["name"],
+                    finished_at=now,
+                    result=finished_check["result"],
+                    duration_seconds=finished_check["duration_seconds"],
+                )
+            except Exception as exc:
+                logger.debug("Could not record finished automation run: %s", exc)
 
     def _queue_run_status(self, message: str) -> None:
         """Mark the current automation intent as queued, not completed."""
@@ -3466,6 +3480,71 @@ class AutomatedStreamManager:
         status["scheduler_retry"] = self._scheduler_retry_status()
 
         return status
+
+    @staticmethod
+    def _snapshot_periods(run_snapshot: Any) -> List[Dict[str, Any]]:
+        """Distinct ``{"id", "name"}`` periods named in a run snapshot."""
+        periods: List[Dict[str, Any]] = []
+        seen_period_ids = set()
+        snapshot = run_snapshot if isinstance(run_snapshot, dict) else {}
+        for item in snapshot.get("effective_profiles") or []:
+            if not isinstance(item, dict) or item.get("period_id") in seen_period_ids:
+                continue
+            seen_period_ids.add(item.get("period_id"))
+            periods.append({"id": item.get("period_id"), "name": item.get("period_name")})
+        return periods
+
+    def _finished_check_record(
+        self,
+        status_data: Dict[str, Any],
+        final_state: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Describe a finished run for the last-check register, or None.
+
+        Only a run that got past period discovery with work (``active_periods``
+        set) is a real check; skipped runs and queued intents are not.
+        """
+        if final_state not in {"completed", "completed_degraded", "failed", "aborted"}:
+            return None
+        if not ((status_data.get("counts") or {}).get("active_periods") or 0) > 0:
+            return None
+        from apps.orchestration.widget_snapshot import period_display_name
+
+        return {
+            "name": period_display_name(
+                self._snapshot_periods(status_data.get("run_snapshot")),
+                status_data.get("forced_period_id"),
+            ),
+            "result": final_state,
+            "duration_seconds": status_data.get("duration_seconds"),
+        }
+
+    def get_widget_run_state(self) -> Dict[str, Any]:
+        """Small, shallow snapshot of the run for the widget endpoint.
+
+        Unlike get_run_status this never deep-copies run_snapshot or
+        stages; it copies only the handful of fields the widget needs.
+        """
+        self._ensure_run_status_fields()
+        with self._run_status_lock:
+            status = self._run_status
+            progress = status.get("progress") or {}
+            periods = self._snapshot_periods(status.get("run_snapshot"))
+            return {
+                "thread_alive": bool(self.automation_thread and self.automation_thread.is_alive()),
+                "state": status.get("state"),
+                "active": bool(status.get("active")),
+                "stage": status.get("stage"),
+                "stage_label": status.get("stage_label"),
+                "progress": {
+                    "current": progress.get("current"),
+                    "total": progress.get("total"),
+                    "percent": progress.get("percent"),
+                },
+                "started_at": status.get("started_at"),
+                "forced_period_id": status.get("forced_period_id"),
+                "periods": periods,
+            }
 
     def get_status(self) -> Dict[str, Any]:
         """Legacy status snapshot used by older API/tests."""
