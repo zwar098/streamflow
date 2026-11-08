@@ -45,7 +45,7 @@ def _as_int(value: Any, default: int = 0) -> int:
 
 def _is_running_state(value: Any) -> bool:
     state = str(value or "").strip().lower()
-    return state in {"running", "active", "checking", "refreshing", "queued", "in_progress"}
+    return state in {"running", "active", "checking", "refreshing", "in_progress"}
 
 
 def _job(
@@ -73,9 +73,17 @@ def _automation_jobs(status: Dict[str, Any]) -> List[Dict[str, Any]]:
         return []
 
     state = str(run_status.get("state") or run_status.get("status") or "").lower()
-    active = bool(run_status.get("active")) or _is_running_state(state)
-    if not active:
+    # A run waiting behind the Stream Checker owns nothing yet. Report it so it
+    # stays visible, but never as an active job: counting it blocked every other
+    # request for as long as it waited, even when no full run would ever start.
+    queued = state == "queued"
+    active = not queued and (bool(run_status.get("active")) or _is_running_state(state))
+    if not active and not queued:
         return []
+
+    # The top-level percent lags: only the nested progress block is kept current.
+    progress = _as_dict(run_status.get("progress"))
+    percent = progress.get("percent") if progress.get("percent") is not None else run_status.get("percent")
 
     return [
         _job(
@@ -83,10 +91,11 @@ def _automation_jobs(status: Dict[str, Any]) -> List[Dict[str, Any]]:
             source="automation",
             state=state or "running",
             label=str(run_status.get("stage_label") or run_status.get("stage") or "Full Run"),
+            active=active,
             details={
                 "run_id": run_status.get("run_id"),
                 "stage": run_status.get("stage"),
-                "percent": run_status.get("percent"),
+                "percent": percent,
                 "message": run_status.get("message"),
             },
         )
@@ -150,24 +159,33 @@ def _shadow_jobs(status: Dict[str, Any]) -> List[Dict[str, Any]]:
     ]
 
 
+def _count(value: Any) -> int:
+    return len(value) if isinstance(value, list) else _as_int(value)
+
+
 def _teamarr_jobs(status: Dict[str, Any]) -> List[Dict[str, Any]]:
-    active_checks = status.get("active_checks") or status.get("active_event_checks") or []
-    queue = status.get("queue") or []
-    active_count = len(active_checks) if isinstance(active_checks, list) else _as_int(active_checks)
-    queue_count = len(queue) if isinstance(queue, list) else _as_int(queue)
-    running = bool(status.get("running")) and (active_count > 0 or queue_count > 0)
-    if not running:
+    # Three places hold preflight work: direct-thread checks (``active_checks``),
+    # checks the stream-checker queue is running (``queue_active_checks``) and
+    # checks still waiting in it (``queued_checks``). Only the first used to be
+    # read, so queued preflight work looked like a generic stream_checker job.
+    direct_count = _count(status.get("active_checks") or status.get("active_event_checks"))
+    queue_active_count = _count(status.get("queue_active_checks"))
+    queued_count = _count(status.get("queued_checks"))
+    if direct_count + queue_active_count + queued_count == 0:
         return []
 
+    running_count = direct_count + queue_active_count
     return [
         _job(
             category="event_check",
             source="teamarr_preflight",
-            state="running" if active_count > 0 else "queued",
+            state="running" if running_count > 0 else "queued",
             label="Event Check",
             details={
-                "active_checks": active_count,
-                "queue_size": queue_count,
+                "active_checks": running_count,
+                "direct_checks": direct_count,
+                "queue_active_checks": queue_active_count,
+                "queue_size": queued_count,
             },
         )
     ]
