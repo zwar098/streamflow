@@ -2861,6 +2861,8 @@ class AutomatedStreamManager:
         final_stage = stage or final_state
         final_stage_label = stage_label or self._stage_label(final_stage)
         snapshot_to_store = None
+        from apps.telemetry import last_check_register
+
         with self._run_status_lock:
             status_data = self._run_status
             active_stage = status_data.get("stage")
@@ -2904,20 +2906,23 @@ class AutomatedStreamManager:
                     )
             snapshot_to_store = copy.deepcopy(status_data.get("run_snapshot"))
             finished_check = self._finished_check_record(status_data, final_state)
+            # Record the finished run in the same critical section that turns
+            # ``active`` off. The widget reads run state, then the register, so
+            # a reader that sees "not active" is guaranteed to see the new
+            # record. Persisting the snapshot below is a database write and can
+            # take many seconds; it must not sit between the two.
+            if finished_check:
+                try:
+                    last_check_register.record(
+                        check_type="automation",
+                        name=finished_check["name"],
+                        finished_at=now,
+                        result=finished_check["result"],
+                        duration_seconds=finished_check["duration_seconds"],
+                    )
+                except Exception as exc:
+                    logger.debug("Could not record finished automation run: %s", exc)
         self._store_run_snapshot(snapshot_to_store)
-        if finished_check:
-            try:
-                from apps.telemetry import last_check_register
-
-                last_check_register.record(
-                    check_type="automation",
-                    name=finished_check["name"],
-                    finished_at=now,
-                    result=finished_check["result"],
-                    duration_seconds=finished_check["duration_seconds"],
-                )
-            except Exception as exc:
-                logger.debug("Could not record finished automation run: %s", exc)
 
     def _queue_run_status(self, message: str) -> None:
         """Mark the current automation intent as queued, not completed."""

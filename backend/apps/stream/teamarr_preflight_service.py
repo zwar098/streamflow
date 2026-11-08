@@ -2611,7 +2611,8 @@ class TeamarrPreflightService:
 
             success = bool(result.get("success"))
             event_type = "preflight_completed" if success else "preflight_failed"
-            self._finish_active_check(key)
+            # Record before releasing the active slot so the widget never sees
+            # an idle gap between "no longer checking" and "last check".
             self._record_event(
                 event_type,
                 event,
@@ -2625,16 +2626,17 @@ class TeamarrPreflightService:
                     **quality_profile_details,
                 },
             )
+            self._finish_active_check(key)
             if success and probe_only:
                 self._trigger_teamarr_order_now_after_probe(event)
         except Exception as exc:
             logger.error(f"Teamarr preflight check failed for channel {event.get('dispatcharr_channel_id')}: {exc}", exc_info=True)
-            self._finish_active_check(key)
             self._record_event("preflight_failed", event, {
                 "error": "Teamarr preflight check failed",
                 "bucket": event.get("trigger_bucket"),
                 "duration_seconds": self._seconds_since(check_started_at),
             })
+            self._finish_active_check(key)
         finally:
             self._finish_active_check(key)
 

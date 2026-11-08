@@ -221,6 +221,48 @@ class TestAutomationHook:
 
         assert register.latest()["result"] == state
 
+    def test_record_exists_before_the_slow_snapshot_write_starts(self, manager):
+        """No window where the run is inactive but the register is still old."""
+        self.reach_work_stage(manager, [("p1", "Hourly Automation")])
+        seen = {}
+
+        def slow_store(snapshot):
+            # What the widget would see while the snapshot is being persisted.
+            seen["active"] = manager.get_widget_run_state()["active"]
+            seen["latest"] = register.latest()
+
+        manager._store_run_snapshot = slow_store
+
+        manager._finish_run_status(state="completed", message="done")
+
+        assert seen["active"] is False
+        assert seen["latest"] is not None and seen["latest"]["name"] == "Hourly Automation"
+
+    def test_reader_never_sees_inactive_with_a_stale_register(self, manager):
+        """Same ordering as the endpoint: run state first, then the register."""
+        self.reach_work_stage(manager, [("p1", "Hourly Automation")])
+        in_store = threading.Event()
+        release = threading.Event()
+
+        def blocked_store(snapshot):
+            in_store.set()
+            release.wait(5)
+
+        manager._store_run_snapshot = blocked_store
+        worker = threading.Thread(
+            target=manager._finish_run_status, kwargs={"state": "completed", "message": "done"}
+        )
+        worker.start()
+        try:
+            assert in_store.wait(5)
+            state = manager.get_widget_run_state()
+            latest = register.latest()
+            assert state["active"] is False
+            assert latest is not None and latest["result"] == "completed"
+        finally:
+            release.set()
+            worker.join(5)
+
     def test_skipped_tick_is_never_recorded(self, manager):
         manager._finish_run_status(state="skipped", message="nothing due")
 
@@ -266,6 +308,27 @@ class TestPreflightHook:
         assert latest["channel"] == "NHL | CHI @ CAR"
         assert latest["result"] == "completed"
         assert latest["duration_seconds"] == 182
+
+    @pytest.mark.parametrize("outcome", [{"success": True}, {"success": False, "error": "x"}, "raises"])
+    def test_direct_check_is_recorded_before_the_active_slot_is_released(self, service, outcome):
+        """_run_check writes the register before it frees the active check."""
+        seen = []
+        service._finish_active_check = lambda key: seen.append(register.latest())
+        service.get_config = lambda **kw: {}
+        service._resolve_profile_id = lambda value: None
+        service._quality_profile_details = lambda value: {}
+        checker = Mock()
+        if outcome == "raises":
+            checker.check_single_channel.side_effect = RuntimeError("boom")
+        else:
+            checker.check_single_channel.return_value = outcome
+        service.stream_checker_provider = lambda: checker
+
+        service._run_check("attempt", dict(self.EVENT), {})
+
+        assert seen, "active check was never released"
+        assert seen[0] is not None and seen[0]["type"] == "preflight"
+        assert seen[0]["result"] == ("completed" if outcome == {"success": True} else "failed")
 
     def test_failed_preflight_is_recorded_as_failed(self, service):
         service._record_event("preflight_failed", dict(self.EVENT), {})
