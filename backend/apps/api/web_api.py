@@ -6,6 +6,21 @@ Provides REST API endpoints for the React frontend to interact with
 the automated stream management system.
 """
 
+import sys
+
+if __name__ == "__main__":
+    # entrypoint.sh starts this file as a script, so it runs as ``__main__``.
+    # Register it under its package name too. Otherwise the first
+    # ``from apps.api import web_api`` (the Teamarr preflight service does one)
+    # executes a second copy with its own globals, and that copy's
+    # get_automation_manager() builds a second, idle AutomatedStreamManager
+    # whose period_last_run never moves. The upcoming-events schedule read
+    # that copy, so the dashboard and widget showed a frozen run grid.
+    import apps.api as _api_package
+
+    sys.modules.setdefault("apps.api.web_api", sys.modules[__name__])
+    _api_package.web_api = sys.modules["apps.api.web_api"]
+
 import json
 import logging
 import os
