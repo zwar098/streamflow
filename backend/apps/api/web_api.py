@@ -754,6 +754,32 @@ def health_check_stripped():
     return health_check_response()
 
 
+@app.route('/api/debug/threads', methods=['GET'])
+def debug_threads():
+    """Every thread's current stack, as plain text (docs/checker-queue-lock-stall.md §8.5).
+
+    Diagnostic only: takes no locks, so it answers while a checker lock is stuck.
+    Shows code locations, no variable values. Off unless STREAMFLOW_DEBUG_THREADS
+    is true (default: true while the stall is being investigated; set it to
+    false, or remove this route, once that's done). Rate-limited like any route.
+    """
+    if os.getenv('STREAMFLOW_DEBUG_THREADS', 'true').strip().lower() not in {'1', 'true', 'yes', 'on'}:
+        return error_response("Not found", status_code=404, code="not_found")
+    import threading
+    import traceback
+
+    names = {t.ident: t.name for t in threading.enumerate()}
+    frames = sys._current_frames()
+    lines = [f"Thread dump at {datetime.now().isoformat(timespec='seconds')} ({len(frames)} threads)", ""]
+    for ident, frame in frames.items():
+        lines.append(f"--- {names.get(ident, '?')} (0x{ident:x})")
+        lines.extend(line.rstrip('\n') for line in traceback.format_stack(frame))
+        lines.append("")
+    response = app.response_class("\n".join(lines), mimetype="text/plain")
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
 def _required_services_readiness():
     """Describe configured runtime workers without creating new singletons."""
     if not check_wizard_complete():
