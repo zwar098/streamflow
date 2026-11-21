@@ -19,8 +19,8 @@ from flask import jsonify
 from apps.core.api_responses import error_response
 from apps.core.logging_config import setup_logging
 from apps.orchestration.widget_snapshot import (
+    CANDIDATE_MAX,
     NEXT_CHECK_TOLERANCE_SECONDS,
-    UPCOMING_MAX,
     build_widget_snapshot,
     to_local_aware,
 )
@@ -59,6 +59,10 @@ def _upcoming(items: List[Dict[str, Any]], time_key: str, now: datetime, limit: 
         if at is not None and (now - at).total_seconds() <= NEXT_CHECK_TOLERANCE_SECONDS:
             found.append(item)
             if len(found) >= limit:
+                logger.debug(
+                    "Widget next-check source hit the %s-candidate guard; next_check_count is a lower bound",
+                    limit,
+                )
                 break
     return found
 
@@ -84,7 +88,7 @@ def _automation_candidates(
     )
     return [
         {"type": "automation", "name": event.get("period_name"), "channel": None, "at": event.get("time")}
-        for event in _upcoming(events, "time", now, UPCOMING_MAX)
+        for event in _upcoming(events, "time", now, CANDIDATE_MAX)
     ]
 
 
@@ -103,7 +107,7 @@ def _scheduled_event_candidates(
             "channel": event.get("channel_name"),
             "at": event.get("check_time"),
         }
-        for event in _upcoming(events, "check_time", now, UPCOMING_MAX)
+        for event in _upcoming(events, "check_time", now, CANDIDATE_MAX)
     ]
 
 

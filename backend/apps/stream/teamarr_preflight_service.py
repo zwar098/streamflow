@@ -41,9 +41,9 @@ CONFIG_FILE = CONFIG_DIR / "teamarr_preflight_config.json"
 MAX_EVENTS = 120
 MAX_UPCOMING_EVENTS = 1000
 # Same tolerance the widget applies to an overdue next-check time, and the same
-# list length it shows. Kept equal to apps.orchestration.widget_snapshot.
+# per-source candidate guard. Kept equal to apps.orchestration.widget_snapshot.
 NEXT_CHECK_TOLERANCE_SECONDS = 90
-UPCOMING_MAX = 3
+CANDIDATE_MAX = 200
 TEAMARR_PREFLIGHT_QUEUE_PRIORITY = 100
 ATTEMPT_STATE_KEY = "teamarr_preflight_attempt_state"
 ATTEMPT_STATE_VERSION = 1
@@ -660,9 +660,10 @@ class TeamarrPreflightService:
         Avoids ``get_status``: no recent-event merging, filter options, config
         or queue snapshot. ``active_checks`` are the direct-thread checks only;
         queued ones are reported by the stream checker's own accessor.
-        ``upcoming_checks`` are the earliest scheduled automatic checks (one per
-        event or team, its next one), soonest first and capped at
-        ``UPCOMING_MAX``; ``next_check`` is the first of them, or ``None``.
+        ``upcoming_checks`` are all scheduled automatic checks (one per event or
+        team, its next one), soonest first, up to the ``CANDIDATE_MAX`` guard.
+        The widget counts same-time checks over this list, so it is not cut to
+        the widget's display length. ``next_check`` is the first, or ``None``.
         """
         with self._lock:
             enabled = bool(self._config.get("enabled"))
@@ -703,7 +704,13 @@ class TeamarrPreflightService:
                         },
                     ))
         scheduled.sort(key=lambda pair: pair[0])
-        upcoming_checks = [check for _, check in scheduled[:UPCOMING_MAX]]
+        if len(scheduled) > CANDIDATE_MAX:
+            logger.debug(
+                "Widget preflight snapshot hit the %s-candidate guard (%s scheduled checks)",
+                CANDIDATE_MAX,
+                len(scheduled),
+            )
+        upcoming_checks = [check for _, check in scheduled[:CANDIDATE_MAX]]
         return {
             "enabled": enabled,
             "running": running,

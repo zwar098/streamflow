@@ -21,7 +21,7 @@ ALL_KEYS = {
     "last_check_type", "last_check_name", "last_check_channel", "last_check_at",
     "last_check_epoch", "last_check_result", "last_check_duration_seconds",
     "next_check_type", "next_check_name", "next_check_channel", "next_check_at",
-    "next_check_epoch", "upcoming",
+    "next_check_epoch", "next_check_count", "upcoming",
 }
 
 
@@ -101,8 +101,9 @@ class TestIdle:
         assert snapshot["active_count"] == 0
         assert snapshot["queued"] is False
         assert snapshot["upcoming"] == []
+        assert snapshot["next_check_count"] == 0
         for key in ALL_KEYS - {"schema", "generated_at", "generated_epoch", "active", "active_count", "queued",
-                               "upcoming"}:
+                               "upcoming", "next_check_count"}:
             assert snapshot[key] is None, key
         assert snapshot["generated_epoch"] == int(NOW.timestamp())
 
@@ -328,7 +329,7 @@ class TestUpcoming:
 
         assert snapshot["upcoming"] == []
 
-    def test_the_three_earliest_win_in_order_whatever_the_input_order(self):
+    def test_candidates_are_listed_in_time_order_whatever_the_input_order(self):
         snapshot = build(next_candidates=[
             self.cand("automation", 50), self.cand("preflight", 5), self.cand("scheduled_event", 30),
             self.cand("automation", 10), self.cand("preflight", 40),
@@ -336,7 +337,14 @@ class TestUpcoming:
 
         assert [(i["type"], i["name"]) for i in snapshot["upcoming"]] == [
             ("preflight", "preflight-5"), ("automation", "automation-10"), ("scheduled_event", "scheduled_event-30"),
+            ("preflight", "preflight-40"), ("automation", "automation-50"),
         ]
+
+    def test_fifteen_candidates_give_ten_items(self):
+        snapshot = build(next_candidates=[self.cand("automation", m) for m in range(1, 16)])
+
+        assert len(snapshot["upcoming"]) == 10
+        assert snapshot["upcoming"][-1]["name"] == "automation-10"
 
     def test_fewer_than_three_candidates_gives_a_shorter_list(self):
         assert len(build(next_candidates=[self.cand("automation", 5), self.cand("preflight", 6)])["upcoming"]) == 2
@@ -371,7 +379,7 @@ class TestUpcoming:
     def test_same_name_at_different_times_fills_several_slots(self):
         snapshot = build(next_candidates=[self.cand("automation", m, name="Hourly") for m in (5, 65, 125, 185)])
 
-        assert [i["name"] for i in snapshot["upcoming"]] == ["Hourly"] * 3
+        assert [i["name"] for i in snapshot["upcoming"]] == ["Hourly"] * 4
 
     def test_first_item_is_the_next_check(self):
         snapshot = build(next_candidates=[
@@ -408,6 +416,59 @@ class TestUpcoming:
         ])
 
         assert [i["type"] for i in snapshot["upcoming"]] == ["automation"]
+
+
+class TestNextCheckCount:
+    @staticmethod
+    def at(kind, minutes, name, seconds=0):
+        return {"type": kind, "name": name, "channel": None,
+                "at": NOW + timedelta(minutes=minutes, seconds=seconds)}
+
+    def test_six_at_the_same_time_then_four_later(self):
+        same = [self.at("preflight", 60, f"P{i}") for i in range(4)]
+        same += [self.at("scheduled_event", 60, "S"), self.at("automation", 60, "A")]
+        later = [self.at("automation", 60 + m, f"L{m}") for m in (10, 20, 30, 40)]
+
+        snapshot = build(next_candidates=later + same)
+
+        assert snapshot["next_check_count"] == 6
+        assert [i["name"] for i in snapshot["upcoming"]] == [
+            "A", "P0", "P1", "P2", "P3", "S", "L10", "L20", "L30", "L40",
+        ]
+        assert snapshot["next_check_type"] == "automation"
+
+    def test_count_is_not_limited_by_the_list_length(self):
+        snapshot = build(next_candidates=[self.at("preflight", 60, f"P{i}") for i in range(12)])
+
+        assert snapshot["next_check_count"] == 12
+        assert len(snapshot["upcoming"]) == 10
+
+    def test_exact_duplicates_are_counted_once(self):
+        snapshot = build(next_candidates=[
+            self.at("preflight", 60, "Same"), self.at("preflight", 60, "Same"), self.at("preflight", 60, "Other"),
+        ])
+
+        assert snapshot["next_check_count"] == 2
+
+    def test_a_check_a_few_seconds_later_is_a_different_time(self):
+        snapshot = build(next_candidates=[
+            self.at("preflight", 60, "On time"), self.at("preflight", 60, "Close", seconds=5),
+        ])
+
+        assert snapshot["next_check_count"] == 1
+
+    def test_single_next_check_counts_one(self):
+        assert build(next_candidates=[self.at("automation", 5, "Only")])["next_check_count"] == 1
+
+    def test_overdue_and_invalid_candidates_do_not_count(self):
+        old = self.at("preflight", 0, "Old")
+        old["at"] = NOW - timedelta(minutes=10)
+        snapshot = build(next_candidates=[
+            old, {"type": "manual", "name": "x", "channel": None, "at": NOW + timedelta(minutes=5)},
+            self.at("automation", 5, "Real"),
+        ])
+
+        assert snapshot["next_check_count"] == 1
 
 
 class TestLastCheck:
@@ -473,12 +534,13 @@ class TestSize:
             automation=automation(periods=[{"id": "p", "name": long_text}], stage_label=long_text),
             last_check={"type": "preflight", "name": long_text, "channel": long_text,
                         "finished_at": NOW, "result": "completed", "duration_seconds": 99999},
-            next_candidates=[{"type": "preflight", "name": long_text, "channel": long_text,
-                              "at": NOW + timedelta(hours=1)}],
+            next_candidates=[{"type": "preflight", "name": long_text + str(i), "channel": long_text + str(i),
+                              "at": NOW + timedelta(hours=1, minutes=i)} for i in range(12)],
         )
 
-        # Three upcoming items carry two names each, so the cap is 3 KB.
-        assert len(json.dumps(snapshot, ensure_ascii=False).encode("utf-8")) < 3072
+        # Ten upcoming items carry two names each, so the cap is 6 KB (§15.3 step 5).
+        assert len(snapshot["upcoming"]) == 10
+        assert len(json.dumps(snapshot, ensure_ascii=False).encode("utf-8")) < 6144
         for key in ("name", "stage", "last_check_name", "last_check_channel", "next_check_name", "next_check_channel"):
             assert len(snapshot[key]) <= MAX_TEXT_LENGTH
         assert snapshot["name"].endswith("…")

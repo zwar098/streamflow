@@ -252,7 +252,7 @@ compatibility.
 | GET | `/api/v1/stats/widget` | Flat status document for desktop widgets |
 | GET | `/api/stats/widget` | Unversioned alias |
 
-A small (about 1.2 KB, never more than 3 KB), cheap, read-only document that
+A small (about 2 KB, never more than 6 KB), cheap, read-only document that
 answers four questions: is a real check running, what was the last one to
 finish, what is the next one scheduled, and what are the next few after it. It is built from in-memory state only, so it is safe to poll every
 couple of seconds. Responses carry `Cache-Control: no-store` and the normal API
@@ -280,7 +280,8 @@ the client and the server does not matter.
 | `queued` | An automation run is waiting behind the Stream Checker. Never sets `active`. |
 | `last_check_*` | Type, name, channel, finish time, `result` (`completed`, `completed_degraded`, `failed`, `aborted`) and duration of the newest finished check. |
 | `next_check_*` | Type, name, channel and start time of the earliest upcoming check in the next 24 hours. |
-| `upcoming` | The next 0 to 3 checks of any type, earliest first, as `{type, name, channel, at, epoch}`. `[]` when nothing is scheduled. `upcoming[0]` is always the same check as `next_check_*`. A repeating period can fill several slots. A Teamarr event contributes only its next automatic check (pre-start, then post-start). |
+| `next_check_count` | How many checks, including the next one, start at the same second as it (for example 6 preflight checks at 10:00 gives `6`; show "+5 more"). Counted over every candidate, not the capped `upcoming` list. `0` when nothing is scheduled. |
+| `upcoming` | The next 0 to 10 checks of any type, earliest first, as `{type, name, channel, at, epoch}`. `[]` when nothing is scheduled. `upcoming[0]` is always the same check as `next_check_*`. A repeating period can fill several slots. A Teamarr event contributes only its next automatic check (pre-start, then post-start). |
 
 When several checks run at once the primary is chosen by type (automation, then
 preflight, then scheduled event), then by earliest start. `last_check_*` is held

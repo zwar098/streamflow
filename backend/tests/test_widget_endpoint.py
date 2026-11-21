@@ -242,19 +242,49 @@ def naive_in(minutes):
 
 
 class TestUpcoming:
-    def test_four_future_automation_events_give_three_items(self, client, services):
+    def test_twelve_future_automation_events_give_ten_items(self, client, services):
+        minutes = [5 + 60 * i for i in range(12)]
         services.events_scheduler.get_cached_events_snapshot.return_value = {
-            "events": [{"time": naive_in(m), "period_name": "Hourly Automation"} for m in (5, 65, 125, 185)],
+            "events": [{"time": naive_in(m), "period_name": "Hourly Automation"} for m in minutes],
             "stale": False,
         }
 
         body = client.get("/api/v1/stats/widget").get_json()
 
-        assert [i["type"] for i in body["upcoming"]] == ["automation"] * 3
+        assert [i["type"] for i in body["upcoming"]] == ["automation"] * 10
         assert [i["epoch"] for i in body["upcoming"]] == [
-            int((NOW + timedelta(minutes=m)).timestamp()) for m in (5, 65, 125)
+            int((NOW + timedelta(minutes=m)).timestamp()) for m in minutes[:10]
         ]
         assert body["upcoming"][0]["epoch"] == body["next_check_epoch"]
+        assert body["next_check_count"] == 1
+
+    def test_same_time_count_spans_sources_and_is_not_capped_per_source(self, client, services):
+        # Regression for the per-source cap: preflight used to hand over at most 3.
+        at = (NOW + timedelta(minutes=60)).replace(second=0)
+        services.events_scheduler.get_cached_events_snapshot.return_value = {
+            "events": [{"time": at.replace(tzinfo=None).isoformat(), "period_name": "Hourly"}], "stale": False,
+        }
+        checks = [{"type": "preflight", "name": f"Game {i}", "channel": f"NHL | G{i}", "at": at.isoformat()}
+                  for i in range(5)]
+        services.preflight.get_widget_snapshot.return_value = {
+            "enabled": True, "running": True, "active_checks": [],
+            "next_check": checks[0], "upcoming_checks": checks,
+        }
+
+        body = client.get("/api/v1/stats/widget").get_json()
+
+        assert body["next_check_count"] == 6
+        assert body["next_check_type"] == "automation"
+        assert len(body["upcoming"]) == 6
+
+    def test_scheduled_events_are_not_capped_per_source(self, client, services):
+        at = (NOW + timedelta(minutes=30)).isoformat()
+        services.scheduling.get_scheduled_events.return_value = [
+            {"schedule_type": "check", "check_time": at, "program_title": f"Show {i}", "channel_name": f"C{i}"}
+            for i in range(7)
+        ]
+
+        assert client.get("/api/v1/stats/widget").get_json()["next_check_count"] == 7
 
     def test_monitoring_scheduled_events_are_left_out_of_the_list(self, client, services):
         services.scheduling.get_scheduled_events.return_value = [
@@ -312,7 +342,10 @@ class TestUpcoming:
         assert [i["name"] for i in body["upcoming"]] == ["Show 10", "Show 20"]
 
     def test_nothing_scheduled_gives_an_empty_list(self, client, services):
-        assert client.get("/api/v1/stats/widget").get_json()["upcoming"] == []
+        body = client.get("/api/v1/stats/widget").get_json()
+
+        assert body["upcoming"] == []
+        assert body["next_check_count"] == 0
 
     def test_the_candidate_cache_still_holds_with_the_longer_lists(self, client, services):
         services.events_scheduler.get_cached_events_snapshot.return_value = {

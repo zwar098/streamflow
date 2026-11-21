@@ -167,13 +167,24 @@ class TestPreflightSnapshot:
         assert (teamarr_preflight_service.NEXT_CHECK_TOLERANCE_SECONDS
                 == widget_snapshot.NEXT_CHECK_TOLERANCE_SECONDS)
 
-    def test_upcoming_checks_are_sorted_and_capped_at_three(self):
-        items = [item("E", 50), item("B", 10), item("D", 40), item("A", 5), item("C", 20)]
+    def test_upcoming_checks_are_sorted_and_not_cut_to_the_display_length(self):
+        items = [item(name, minutes) for name, minutes in
+                 [("H", 80), ("E", 50), ("B", 10), ("G", 70), ("D", 40), ("A", 5), ("F", 60), ("C", 20)]]
 
         snapshot = make_preflight(items).get_widget_snapshot()
 
-        assert [c["name"] for c in snapshot["upcoming_checks"]] == ["A", "B", "C"]
+        assert [c["name"] for c in snapshot["upcoming_checks"]] == list("ABCDEFGH")
         assert snapshot["next_check"] == snapshot["upcoming_checks"][0]
+
+    def test_upcoming_checks_stop_at_the_candidate_guard(self, monkeypatch):
+        from apps.stream import teamarr_preflight_service
+
+        monkeypatch.setattr(teamarr_preflight_service, "CANDIDATE_MAX", 4)
+        items = [item(f"E{i}", 5 + i) for i in range(6)]
+
+        snapshot = make_preflight(items).get_widget_snapshot()
+
+        assert [c["name"] for c in snapshot["upcoming_checks"]] == ["E0", "E1", "E2", "E3"]
 
     def test_upcoming_checks_skip_states_that_are_not_scheduled(self):
         due = {"event_name": "Due", "state": "due", "next_automatic_check": {"label": "Due now", "timestamp": None}}
@@ -195,11 +206,12 @@ class TestPreflightSnapshot:
 
         assert [c["name"] for c in snapshot["upcoming_checks"]] == ["Real"]
 
-    def test_list_length_matches_the_widget_builder(self):
+    def test_candidate_guard_matches_the_widget_builder(self):
         from apps.orchestration import widget_snapshot
         from apps.stream import teamarr_preflight_service
 
-        assert teamarr_preflight_service.UPCOMING_MAX == widget_snapshot.UPCOMING_MAX
+        assert teamarr_preflight_service.CANDIDATE_MAX == widget_snapshot.CANDIDATE_MAX
+        assert not hasattr(teamarr_preflight_service, "UPCOMING_MAX")
 
     def test_static_team_items_fall_back_to_the_team_name(self):
         team = item(None, 5)

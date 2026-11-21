@@ -19,8 +19,9 @@ slot or a direct thread, each with ``source``, ``scheduled_event_id``,
 
 ``last_check``: the newest register record or ``None``.
 ``next_candidates``: ``[{"type", "name", "channel", "at"}]``, any number, in any
-order. The earliest becomes the ``next_check_*`` fields and the earliest
-``UPCOMING_MAX`` fill ``upcoming``.
+order, ideally every candidate in the look-ahead window. The earliest becomes the
+``next_check_*`` fields, ``next_check_count`` counts how many start at that same
+second, and the earliest ``UPCOMING_MAX`` fill ``upcoming``.
 """
 
 from __future__ import annotations
@@ -31,7 +32,11 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 SCHEMA_VERSION = 1
 MAX_TEXT_LENGTH = 80
 NEXT_CHECK_TOLERANCE_SECONDS = 90
-UPCOMING_MAX = 3
+# Length of the ``upcoming`` list in the reply.
+UPCOMING_MAX = 10
+# Guard on how many candidates one source hands over. Far above a real day's
+# worth; when it is hit, ``next_check_count`` is a lower bound.
+CANDIDATE_MAX = 200
 
 # Same order as AutomatedStreamManager.RUN_STAGES.
 RUN_STAGE_ORDER: Tuple[str, ...] = (
@@ -338,7 +343,12 @@ def _next_check_block(candidates: Iterable[Dict[str, Any]], now: datetime) -> Di
 
 
 def _upcoming_block(candidates: Iterable[Dict[str, Any]], now: datetime) -> Dict[str, Any]:
-    """The next ``UPCOMING_MAX`` checks, soonest first (``upcoming[0]`` is ``next_check``)."""
+    """``next_check_count`` and the next ``UPCOMING_MAX`` checks, soonest first.
+
+    ``upcoming[0]`` is the next check. ``next_check_count`` is how many checks,
+    including it, start at the same second. It is counted over every candidate
+    after de-duplication, never over the capped list.
+    """
     ranked: List[Tuple[Tuple[float, int], Dict[str, Any], datetime]] = []
     for candidate in candidates or []:
         if not isinstance(candidate, dict) or candidate.get("type") not in TYPE_PRIORITY:
@@ -366,9 +376,10 @@ def _upcoming_block(candidates: Iterable[Dict[str, Any]], now: datetime) -> Dict
             continue
         seen.add(identity)
         items.append(item)
-        if len(items) >= UPCOMING_MAX:
-            break
-    return {"upcoming": items}
+
+    first_epoch = items[0]["epoch"] if items else None
+    same_time = sum(1 for item in items if item["epoch"] == first_epoch) if items else 0
+    return {"next_check_count": same_time, "upcoming": items[:UPCOMING_MAX]}
 
 
 # ---------------------------------------------------------------------------
