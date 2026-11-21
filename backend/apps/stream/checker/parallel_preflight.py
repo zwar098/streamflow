@@ -53,7 +53,7 @@ class CheckerParallelPreflightMixin:
                 or self._sync_batch_execution_active
                 or self.sync_batch_state.get("active")
                 or self._specialized_queue_gate_active_locked()
-                or self.check_queue.get_status().get("paused")
+                or self.check_queue.is_paused()
             ):
                 return bool(runs)
             if runs and (len(runs) >= limit or self.abort_current_check.is_set()):

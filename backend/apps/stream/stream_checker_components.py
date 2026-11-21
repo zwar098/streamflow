@@ -1075,6 +1075,11 @@ class StreamCheckQueue:
                 self.paused = normalized_paused
                 self._bump_admission_revision_locked()
 
+    def is_paused(self) -> bool:
+        """Cheap pause check; ``get_status()`` builds every entry snapshot."""
+        with self.lock:
+            return bool(self.paused)
+
     @staticmethod
     def _wait_after_deferred_entry(timeout: float) -> None:
         try:
@@ -1223,22 +1228,24 @@ class StreamCheckQueue:
                     self.stats['queue_size'] = len(self.queued)
                     return None
 
-                if self.paused:
-                    self.queue.put_nowait(item)
-                    self._maybe_compact_queue_heap_locked()
-                    self.stats['queue_size'] = len(self.queued)
-                    self._wait_after_deferred_entry(timeout)
-                    return None
-
                 metadata = self.queued_metadata.get(channel_id, {}) or {}
-                if metadata.get("source") in self.deferred_metadata_sources or metadata.get("source") in (excluded_metadata_sources or ()):
+                source = metadata.get("source")
+                if (
+                    self.paused
+                    or source in self.deferred_metadata_sources
+                    or source in (excluded_metadata_sources or ())
+                ):
                     self.queue.put_nowait(item)
                     self._maybe_compact_queue_heap_locked()
                     self.stats['queue_size'] = len(self.queued)
-                    self._wait_after_deferred_entry(timeout)
-                    return None
-
-                return self._activate_queued_entry_locked(channel_id)
+                else:
+                    return self._activate_queued_entry_locked(channel_id)
+            # The entry is back on the queue. Back off outside the lock: status
+            # readers (widget, queue endpoint, UI) must not wait behind a
+            # sleeping worker, and an unfair lock let the worker re-take it
+            # before them for tens of seconds.
+            self._wait_after_deferred_entry(timeout)
+            return None
         except queue.Empty:
             return None
 
