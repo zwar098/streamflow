@@ -43,6 +43,11 @@ def reset_next_check_cache() -> None:
         _next_cache["candidates"] = []
 
 
+# How long the widget waits for a busy stream-checker lock before it answers
+# without the event-check block (docs/checker-queue-lock-stall.md §8.4).
+CHECKER_LOCK_TIMEOUT_SECONDS = 2.0
+
+
 def _safe(name: str, getter: Callable[[], Any]) -> Any:
     try:
         return getter()
@@ -164,7 +169,8 @@ def get_widget_stats_response(
         event_checks = _safe(
             "event checks",
             lambda: get_stream_checker_service().get_widget_event_checks(
-                extra_channel_ids=[c["channel_id"] for c in direct_checks if c.get("channel_id") is not None]
+                extra_channel_ids=[c["channel_id"] for c in direct_checks if c.get("channel_id") is not None],
+                lock_timeout=CHECKER_LOCK_TIMEOUT_SECONDS,
             ),
         ) or {"entries": [], "progress_by_channel": {}, "stale_after_seconds": None}
         event_checks = {**event_checks, "entries": list(event_checks.get("entries") or []) + direct_checks}

@@ -6,11 +6,31 @@ from copy import deepcopy
 from collections import Counter
 from datetime import datetime
 from typing import Any, Dict, List, Optional
+from contextlib import contextmanager
 from apps.stream.stream_check_utils import _stream_analysis_timeout
 from apps.stream.stale_status_snapshot import external_m3u_account_risk, external_message_class
 from apps.core.operation_timing import STREAM_OPERATION_TIMINGS
 
 logger = logging.getLogger("apps.stream.stream_checker_service")
+
+
+class CheckerLockBusy(TimeoutError):
+    """A checker lock stayed busy past a reader's ``lock_timeout``."""
+
+
+@contextmanager
+def _hold(lock, timeout, name):
+    """``with lock:``, or give up after ``timeout`` seconds when one is given."""
+    if timeout is None:
+        with lock:
+            yield
+        return
+    if not lock.acquire(timeout=max(0.0, float(timeout))):
+        raise CheckerLockBusy(f"stream checker {name} lock busy for over {timeout}s")
+    try:
+        yield
+    finally:
+        lock.release()
 
 
 class CheckerStatusMixin:
@@ -426,7 +446,7 @@ class CheckerStatusMixin:
             return self.progress.clear_if_matches(expected_progress)
 
 
-    def get_widget_event_checks(self, extra_channel_ids=()) -> Dict[str, Any]:
+    def get_widget_event_checks(self, extra_channel_ids=(), *, lock_timeout=None) -> Dict[str, Any]:
         """Small, read-only view of event checks that own a queue slot.
 
         Built for the widget endpoint, so it never touches ``completed_entries``
@@ -439,9 +459,13 @@ class CheckerStatusMixin:
         persisted progress is a database read. Progress is returned per channel
         so the caller can decorate an owned entry; progress alone never makes a
         check active.
+
+        With ``lock_timeout`` (seconds), a checker lock that stays busy longer
+        raises ``CheckerLockBusy`` instead of waiting, so one slow lock holder
+        can't hold up the widget endpoint (and the API threads behind it).
         """
         entries: List[Dict[str, Any]] = []
-        with self.check_queue.lock:
+        with _hold(self.check_queue.lock, lock_timeout, "queue"):
             for channel_id, metadata in list(self.check_queue.in_progress_metadata.items()):
                 if not isinstance(metadata, dict):
                     continue
@@ -475,7 +499,7 @@ class CheckerStatusMixin:
                 }
 
             keep(self.progress.get())
-            for item in self._parallel_preflight_progress():
+            for item in self._parallel_preflight_progress(lock_timeout=lock_timeout):
                 keep(item.get('progress'))
 
             # Scheduled events carry only the program title; fill in the channel.

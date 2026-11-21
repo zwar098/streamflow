@@ -2763,7 +2763,16 @@ def serve_frontend(path):
 
 if __name__ == '__main__':
     import argparse
+    import faulthandler
+    import signal
     from apps.database.connection import init_db
+
+    # `docker compose kill -s USR1 stream-checker` writes every thread's stack to
+    # the container log (stderr). Diagnostic only: it never stops the process and
+    # costs nothing until the signal arrives. Without this handler SIGUSR1 would
+    # end the process, so keep it registered before anyone sends the signal.
+    if hasattr(signal, "SIGUSR1"):
+        faulthandler.register(signal.SIGUSR1, all_threads=True)
     
     parser = argparse.ArgumentParser(description='StreamFlow for Dispatcharr Web API')
     parser.add_argument('--host', default=os.environ.get('API_HOST', '0.0.0.0'), help='Host to bind to')
@@ -3013,7 +3022,13 @@ if __name__ == '__main__':
         logger.info(f"Starting production WSGI server on {args.host}:{args.port}")
         try:
             from waitress import serve
-            serve(app, host=args.host, port=args.port, threads=8)
+            # Headroom so /api/health and other pages keep answering while
+            # status readers wait on a busy checker lock.
+            try:
+                waitress_threads = max(4, int(os.environ.get('API_THREADS', '16')))
+            except ValueError:
+                waitress_threads = 16
+            serve(app, host=args.host, port=args.port, threads=waitress_threads)
         except ImportError:
             logger.warning("Waitress not installed, falling back to development server.")
             logger.warning("Please install waitress: pip install waitress")

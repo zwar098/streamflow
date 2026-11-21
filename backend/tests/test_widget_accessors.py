@@ -1,6 +1,7 @@
 """The small read-only accessors behind the widget endpoint, and the queue hook."""
 
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 from unittest.mock import Mock
 
@@ -105,6 +106,61 @@ class TestCheckerEventChecks:
         monkeypatch.setattr(checker.check_queue, "get_status", Mock(side_effect=AssertionError("queue status")))
 
         checker.get_widget_event_checks()
+
+
+class TestCheckerEventChecksLockTimeout:
+    """docs/checker-queue-lock-stall.md §8.4: a busy lock must not hold up the widget."""
+
+    @staticmethod
+    def held_elsewhere(lock):
+        taken, release = threading.Event(), threading.Event()
+
+        def holder():
+            with lock:
+                taken.set()
+                release.wait(5)
+
+        thread = threading.Thread(target=holder, daemon=True)
+        thread.start()
+        assert taken.wait(2)
+        return release, thread
+
+    def test_busy_queue_lock_gives_up_after_the_timeout(self, checker):
+        from apps.stream.checker.status import CheckerLockBusy
+
+        release, thread = self.held_elsewhere(checker.check_queue.lock)
+        try:
+            started = time.monotonic()
+            with pytest.raises(CheckerLockBusy):
+                checker.get_widget_event_checks(lock_timeout=0.1)
+            assert time.monotonic() - started < 1.0
+        finally:
+            release.set()
+            thread.join(2)
+
+    def test_busy_checker_lock_gives_up_after_the_timeout(self, checker, monkeypatch):
+        from apps.stream.checker.status import CheckerLockBusy
+
+        put_in_progress(checker, 1, {"source": "teamarr_preflight", "event": {"event_name": "A"}})
+        monkeypatch.setattr(checker.progress, "get", Mock(return_value=None))
+        release, thread = self.held_elsewhere(checker.lock)
+        try:
+            with pytest.raises(CheckerLockBusy):
+                checker.get_widget_event_checks(lock_timeout=0.1)
+        finally:
+            release.set()
+            thread.join(2)
+
+    def test_free_locks_give_the_normal_result_and_are_released(self, checker, monkeypatch):
+        put_in_progress(checker, 1, {"source": "teamarr_preflight", "event": {"event_name": "A"}})
+        monkeypatch.setattr(checker.progress, "get", Mock(return_value=None))
+
+        result = checker.get_widget_event_checks(lock_timeout=0.1)
+
+        assert [e["channel_id"] for e in result["entries"]] == [1]
+        assert not checker.check_queue.lock.locked()
+        assert checker.lock.acquire(blocking=False)
+        checker.lock.release()
 
 
 # ---------------------------------------------------------------------------

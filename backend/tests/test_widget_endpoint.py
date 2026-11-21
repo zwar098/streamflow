@@ -123,7 +123,9 @@ def test_direct_preflight_checks_are_merged_and_their_progress_is_requested(clie
     body = client.get("/api/v1/stats/widget").get_json()
 
     assert (body["type"], body["name"]) == ("preflight", "CHI at CAR")
-    services.checker.get_widget_event_checks.assert_called_once_with(extra_channel_ids=[7])
+    services.checker.get_widget_event_checks.assert_called_once_with(
+        extra_channel_ids=[7], lock_timeout=widget_handlers.CHECKER_LOCK_TIMEOUT_SECONDS,
+    )
 
 
 def test_a_failing_source_is_nulled_not_fatal(client, services):
@@ -135,6 +137,21 @@ def test_a_failing_source_is_nulled_not_fatal(client, services):
 
     assert response.status_code == 200
     assert response.get_json()["active"] is False
+
+
+def test_a_busy_checker_lock_still_gives_a_200(client, services):
+    from apps.stream.checker.status import CheckerLockBusy
+
+    services.checker.get_widget_event_checks.side_effect = CheckerLockBusy("queue lock busy")
+
+    response = client.get("/api/v1/stats/widget")
+
+    assert response.status_code == 200
+    assert response.get_json()["active"] is False
+
+
+def test_the_checker_lock_wait_is_short():
+    assert 0 < widget_handlers.CHECKER_LOCK_TIMEOUT_SECONDS <= 5
 
 
 def test_builder_failure_returns_a_500(client, services, monkeypatch):

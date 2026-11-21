@@ -122,8 +122,10 @@ class CheckerParallelPreflightMixin:
             raise
         return True
 
-    def _parallel_preflight_progress(self):
-        with self.lock:
+    def _parallel_preflight_progress(self, *, lock_timeout=None):
+        from apps.stream.checker.status import _hold
+
+        with _hold(self.lock, lock_timeout, "checker"):
             return [
                 {"channel_id": key[0], "queue_entry_token": key[1], "progress": run.progress.get()}
                 for key, run in getattr(self, '_parallel_preflight_runs', {}).items()
