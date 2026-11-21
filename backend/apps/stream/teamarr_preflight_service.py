@@ -1535,20 +1535,12 @@ class TeamarrPreflightService:
         cooldown collapses bursts from several preflight checks completing close
         together unless ``force`` is set (used by the manual "Order now" action).
 
-        Teamarr's own ordering pass (as of the version this was verified
-        against) loads each channel's streams into memory, *then* refreshes
-        stream_stats from Dispatcharr and writes that into its database —
-        but it never re-reads the streams it already loaded, so it scores
-        using whatever was cached before its own refresh. The freshly
-        probed stats land in Teamarr's database either way, just too late
-        for that same run to use them. Calling the endpoint twice back to
-        back works around this: the first call's refresh is what the
-        second call's own (now up to date) in-memory load picks up, so the
-        second call actually scores against the stats this probe just
-        wrote. No delay is needed between the two calls — Teamarr's stats
-        write commits before it responds, and its own database read for
-        the second call happens after that response is received. Revert
-        to a single call if Teamarr fixes this upstream.
+        One POST is enough on Teamarr 2.26.0 and later. Before that, its
+        ordering pass read each channel's streams *before* refreshing
+        stream_stats from Dispatcharr, so it scored against the previous
+        stats and StreamFlow had to call the endpoint twice. Teamarr fixed
+        that upstream (Pharaoh-Labs/teamarr#1180, released in v2.26.0): the
+        refresh now lands before the rows are read.
         """
         base_url = str(config.get("teamarr_base_url") or "").strip()
         if not base_url:
@@ -1565,12 +1557,6 @@ class TeamarrPreflightService:
         api_key = str(config.get("api_key") or "")
         if api_key:
             headers[str(config.get("api_key_header") or DEFAULT_CONFIG["api_key_header"])] = api_key
-
-        priming_result = self._post_teamarr_order_now_once(base_url, headers)
-        if not priming_result.get("success"):
-            with self._lock:
-                self._last_teamarr_order_result = priming_result
-            return priming_result
 
         result = self._post_teamarr_order_now_once(base_url, headers)
         with self._lock:
@@ -2589,17 +2575,31 @@ class TeamarrPreflightService:
             self._trigger_teamarr_order_now_after_probe(event)
 
     def _trigger_teamarr_order_now_after_probe(self, event: Dict[str, Any]) -> None:
+        """Ask Teamarr to re-order streams after a successful probe-only check, in the background.
+
+        Callers include the stream checker's completion step, which holds the
+        checker lock (docs/checker-queue-lock-stall.md §9). The order-now call
+        is network I/O with a 30 s timeout per POST, so it must never run on
+        the caller's thread. The debounce in ``trigger_teamarr_order_now`` still
+        collapses bursts of completions into one order-now.
+        """
+        def run() -> None:
+            try:
+                config = self.get_config(include_secret=True)
+                order_result = self.trigger_teamarr_order_now(config)
+                if not order_result.get("success") and not order_result.get("skipped"):
+                    self._record_event(
+                        "teamarr_order_now_failed",
+                        event,
+                        {"error": order_result.get("error"), "code": order_result.get("code")},
+                    )
+            except Exception as exc:
+                logger.warning("Could not trigger Teamarr order-now after probe: %s", exc)
+
         try:
-            config = self.get_config(include_secret=True)
-            order_result = self.trigger_teamarr_order_now(config)
-            if not order_result.get("success") and not order_result.get("skipped"):
-                self._record_event(
-                    "teamarr_order_now_failed",
-                    event,
-                    {"error": order_result.get("error"), "code": order_result.get("code")},
-                )
+            threading.Thread(target=run, daemon=True, name="TeamarrOrderNow").start()
         except Exception as exc:
-            logger.warning("Could not trigger Teamarr order-now after probe: %s", exc)
+            logger.warning("Could not start Teamarr order-now after probe: %s", exc)
 
     def _run_check(self, key: str, event: Dict[str, Any], config: Dict[str, Any]) -> None:
         check_started_at = self.clock()
