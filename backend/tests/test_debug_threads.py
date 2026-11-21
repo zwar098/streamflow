@@ -15,7 +15,7 @@ def client():
 
 
 def test_returns_every_thread_as_plain_text(client, monkeypatch):
-    monkeypatch.delenv("STREAMFLOW_DEBUG_THREADS", raising=False)
+    monkeypatch.setenv("STREAMFLOW_DEBUG_THREADS", "true")
     marker = threading.Event()
     worker = threading.Thread(target=marker.wait, args=(5,), name="dump-test-worker", daemon=True)
     worker.start()
@@ -35,6 +35,12 @@ def test_returns_every_thread_as_plain_text(client, monkeypatch):
     assert "test_debug_threads.py" in body
 
 
+def test_off_by_default(client, monkeypatch):
+    monkeypatch.delenv("STREAMFLOW_DEBUG_THREADS", raising=False)
+
+    assert client.get(URL).status_code == 404
+
+
 @pytest.mark.parametrize("value", ["false", "0", "off", "no"])
 def test_switched_off_gives_a_404(client, monkeypatch, value):
     monkeypatch.setenv("STREAMFLOW_DEBUG_THREADS", value)
@@ -47,7 +53,7 @@ def test_answers_while_the_checker_queue_lock_is_held(client, monkeypatch, tmp_p
 
     monkeypatch.setattr(scs, "CONFIG_DIR", tmp_path)
     checker = scs.StreamCheckerService()
-    monkeypatch.delenv("STREAMFLOW_DEBUG_THREADS", raising=False)
+    monkeypatch.setenv("STREAMFLOW_DEBUG_THREADS", "true")
     result = {}
 
     with checker.check_queue.lock, checker.lock:

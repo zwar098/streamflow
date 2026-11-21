@@ -760,10 +760,10 @@ def debug_threads():
 
     Diagnostic only: takes no locks, so it answers while a checker lock is stuck.
     Shows code locations, no variable values. Off unless STREAMFLOW_DEBUG_THREADS
-    is true (default: true while the stall is being investigated; set it to
-    false, or remove this route, once that's done). Rate-limited like any route.
+    is true (set it on the container to diagnose a lock stall). Rate-limited like
+    any route.
     """
-    if os.getenv('STREAMFLOW_DEBUG_THREADS', 'true').strip().lower() not in {'1', 'true', 'yes', 'on'}:
+    if os.getenv('STREAMFLOW_DEBUG_THREADS', 'false').strip().lower() not in {'1', 'true', 'yes', 'on'}:
         return error_response("Not found", status_code=404, code="not_found")
     import threading
     import traceback
