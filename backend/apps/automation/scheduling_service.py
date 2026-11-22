@@ -2343,8 +2343,11 @@ class SchedulingService:
             if skipped:
                 logger.debug(f"Skipped {skipped} EPG programs with no EPG identifier field")
 
+            aliased = self._alias_programs_by_epg_data_id(base_url, by_tvg_id)
+
             logger.debug(
                 f"Fetched {len(raw)} EPG programs across {len(by_tvg_id)} EPG identifiers "
+                f"({aliased} EPG data ids aliased) "
                 f"from {page_count} page(s); added {grid_count} grid and "
                 f"{current_count} current-program entries"
             )
@@ -2361,6 +2364,52 @@ class SchedulingService:
         except Exception as e:
             logger.error(f"Error fetching all EPG programs: {e}")
             return stale_cache['by_tvg_id'] if stale_cache else {}
+
+    def _alias_programs_by_epg_data_id(
+        self,
+        base_url: str,
+        by_tvg_id: Dict[str, List[Dict[str, Any]]],
+    ) -> int:
+        """File each EPG entry's programs under its Dispatcharr EPG data id too.
+
+        Dispatcharr's program lists carry only the EPG entry's own ``tvg_id``
+        (for example a Gracenote station id such as ``65025``). A channel can
+        have a different ``tvg_id`` of its own (``nflnetwork.us``) while its
+        assigned EPG entry, which the TV Guide shows, is known only by its
+        ``epg_data_id``. Without this mapping such a channel matched nothing
+        but the current-programs fallback, so Auto-Create rules never saw its
+        later programs. Channels already list ``epg_data_id`` among their EPG
+        identifiers, so aliasing the programs under it is enough.
+
+        Runs outside ``_lock`` (one extra request per EPG cache refresh).
+        Best effort: on failure the cache is built exactly as before.
+        """
+        try:
+            entries = fetch_data_from_url(f"{base_url}/api/epg/epgdata/")
+        except Exception as exc:
+            logger.debug("Unable to fetch Dispatcharr EPG data entries: %s", exc)
+            return 0
+        if isinstance(entries, dict):
+            entries = entries.get('results', entries.get('data', []))
+        if not isinstance(entries, list):
+            return 0
+
+        aliased = 0
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            epg_data_id = entry.get('id')
+            tvg_id = entry.get('tvg_id')
+            if epg_data_id in (None, '') or tvg_id in (None, ''):
+                continue
+            programs = by_tvg_id.get(str(tvg_id))
+            key = str(epg_data_id)
+            if not programs or key == str(tvg_id):
+                continue
+            existing = by_tvg_id.get(key)
+            by_tvg_id[key] = list(existing) + programs if existing else programs
+            aliased += 1
+        return aliased
 
     def _merge_program_sources(
         self,

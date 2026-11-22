@@ -190,12 +190,13 @@ class TestRegexMatchingIntegration(unittest.TestCase):
 
         with patch('apps.automation.scheduling_service.fetch_data_from_url') as mock_fetch, \
                 patch('apps.automation.scheduling_service.post_request') as mock_post:
-            mock_fetch.side_effect = [first_page, second_page, {'data': []}]
+            mock_fetch.side_effect = [first_page, second_page, {'data': []}, []]
             mock_post.return_value.json.return_value = []
             result = self.service.match_programs_to_rules(force_refresh=True)
 
         self.assertEqual(result['created'], 2)
-        self.assertEqual(mock_fetch.call_count, 3)
+        # Two program pages, the grid, and the EPG data entries.
+        self.assertEqual(mock_fetch.call_count, 4)
         self.assertEqual(
             [event['program_title'] for event in self.service.get_scheduled_events()],
             ['Live: MLB', 'Live: MLB'],
@@ -347,14 +348,82 @@ class TestRegexMatchingIntegration(unittest.TestCase):
 
         with patch('apps.automation.scheduling_service.fetch_data_from_url') as mock_fetch, \
                 patch('apps.automation.scheduling_service.post_request') as mock_post:
-            mock_fetch.side_effect = [programs_payload, grid_payload]
+            mock_fetch.side_effect = [programs_payload, grid_payload, []]
             mock_post.return_value.json.return_value = []
             result = self.service.match_programs_to_rules(force_refresh=True)
 
         events = self.service.get_scheduled_events()
         self.assertEqual(result['created'], 1)
-        self.assertEqual(mock_fetch.call_count, 2)
+        self.assertEqual(mock_fetch.call_count, 3)
         self.assertEqual(events[0]['program_title'], 'Live: MLB')
+
+    def test_match_programs_finds_epg_entry_known_only_by_epg_data_id(self):
+        """A channel whose own tvg_id differs from its EPG entry's still gets its guide.
+
+        Regression: channel "NFL RedZone" had tvg_id ``nflnetwork.us`` and EPG data
+        4152794, whose programs carry tvg_id ``65025``. Only the current program
+        (matched by channel uuid) was found, so later programs never matched.
+        """
+        now = datetime.now(timezone.utc)
+        self.mock_udi.return_value.get_channel_by_id.return_value = {
+            'id': 1,
+            'name': 'NFL RedZone',
+            'tvg_id': 'nflnetwork.us',
+            'epg_data_id': 4152794,
+            'logo_id': None,
+        }
+        upcoming = {
+            'title': 'NFL RedZone',
+            'start_time': (now + timedelta(hours=3)).isoformat(),
+            'end_time': (now + timedelta(hours=9)).isoformat(),
+            'tvg_id': '65025',
+        }
+        epg_entries = [
+            {'id': 4152794, 'tvg_id': '65025', 'name': 'NFL RedZone', 'epg_source': 3},
+            {'id': 77, 'tvg_id': 'unrelated', 'name': 'Other', 'epg_source': 3},
+        ]
+
+        with self.service._lock:
+            self.service._auto_create_rules = [{
+                'id': 'redzone-rule',
+                'name': 'Redzone Pre-Check',
+                'channel_ids': [1],
+                'regex_pattern': '^NFL RedZone$',
+                'minutes_before': 6,
+            }]
+
+        with patch('apps.automation.scheduling_service.fetch_data_from_url') as mock_fetch, \
+                patch('apps.automation.scheduling_service.post_request') as mock_post:
+            mock_fetch.side_effect = [[upcoming], {'data': []}, epg_entries]
+            mock_post.return_value.json.return_value = []
+            result = self.service.match_programs_to_rules(force_refresh=True)
+
+        events = self.service.get_scheduled_events()
+        self.assertEqual(result['created'], 1)
+        self.assertEqual(events[0]['program_title'], 'NFL RedZone')
+        self.assertTrue(mock_fetch.call_args_list[-1][0][0].endswith('/api/epg/epgdata/'))
+
+    def test_epg_data_lookup_failure_keeps_the_old_matching(self):
+        now = datetime.now(timezone.utc)
+        program = {
+            'title': 'Live: MLB',
+            'start_time': (now + timedelta(hours=1)).isoformat(),
+            'end_time': (now + timedelta(hours=4)).isoformat(),
+            'tvg_id': 'test-channel-1',
+        }
+        with self.service._lock:
+            self.service._auto_create_rules = [{
+                'id': 'mlb-rule', 'name': 'MLB', 'channel_id': 1,
+                'regex_pattern': '^Live: MLB', 'minutes_before': 0,
+            }]
+
+        with patch('apps.automation.scheduling_service.fetch_data_from_url') as mock_fetch, \
+                patch('apps.automation.scheduling_service.post_request') as mock_post:
+            mock_fetch.side_effect = [[program], {'data': []}, RuntimeError('epgdata down')]
+            mock_post.return_value.json.return_value = []
+            result = self.service.match_programs_to_rules(force_refresh=True)
+
+        self.assertEqual(result['created'], 1)
 
     def test_regex_preview_uses_effective_epg_tvg_id(self):
         """The test popup should use the same effective EPG identity as matching."""
